@@ -1,0 +1,17 @@
+{
+  "name": "Mukil's Dev Agent Sessions",
+  "short_name": "Agent Sessions",
+  "description": "Manage Claude and Codex tmux sessions by branch",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#11161d",
+  "theme_color": "#18202b",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

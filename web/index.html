@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+    <meta name="theme-color" content="#0a0d12" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="agent-ops" />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" />
+    <link rel="stylesheet" href="/vendor/xterm/css/xterm.css" />
+    <link rel="stylesheet" href="/styles.css" />
+    <title>agent-ops · dev console</title>
+  </head>
+  <body data-route="sessions">
+    <div class="app">
+      <aside class="sidebar" id="sidebar">
+        <div class="brand">
+          <div class="brand-mark"></div>
+          <div>
+            <div class="brand-title">agent-ops</div>
+            <div class="brand-sub" id="brand-host">…</div>
+          </div>
+        </div>
+        <nav class="nav">
+          <a href="#sessions" data-route="sessions" class="nav-item"><span class="nav-icon">◇</span><span>Sessions</span><span class="nav-badge" data-badge="sessions"></span></a>
+          <a href="#terminal" data-route="terminal" class="nav-item"><span class="nav-icon">▣</span><span>Terminal</span></a>
+          <a href="#projects" data-route="projects" class="nav-item"><span class="nav-icon">⬡</span><span>Projects</span><span class="nav-badge" data-badge="projects"></span></a>
+          <a href="#ai" data-route="ai" class="nav-item"><span class="nav-icon">✦</span><span>AI</span><span class="nav-badge accent" data-badge="ai-on">off</span></a>
+          <a href="#events" data-route="events" class="nav-item"><span class="nav-icon">≡</span><span>Events</span><span class="nav-badge" data-badge="events"></span></a>
+          <a href="#settings" data-route="settings" class="nav-item"><span class="nav-icon">⚙</span><span>Settings</span></a>
+        </nav>
+        <div class="sidebar-foot">
+          <div class="stat-grid" id="stat-grid">
+            <div class="stat"><span>CPU</span><b id="stat-cpu">—</b></div>
+            <div class="stat"><span>Mem</span><b id="stat-mem">—</b></div>
+            <div class="stat"><span>Disk</span><b id="stat-disk">—</b></div>
+            <div class="stat"><span>Up</span><b id="stat-up">—</b></div>
+          </div>
+          <div class="health-row">
+            <span class="dot" id="health-dot"></span>
+            <span id="health-text">connecting…</span>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <button class="icon-btn nav-toggle" id="nav-toggle" aria-label="Toggle nav">☰</button>
+          <div class="crumbs">
+            <span id="crumb-page">Sessions</span>
+            <span class="crumb-sep">/</span>
+            <span class="crumb-context" id="crumb-context"></span>
+          </div>
+          <div class="topbar-actions">
+            <span class="kbd-hint">⌘K</span>
+            <button class="icon-btn" id="refresh" title="Refresh">↻</button>
+          </div>
+        </header>
+
+        <section class="page" id="page-root" aria-live="polite"></section>
+      </main>
+
+      <nav class="bottom-tabs">
+        <a href="#sessions" data-route="sessions"><span>◇</span><span>Sessions</span></a>
+        <a href="#terminal" data-route="terminal"><span>▣</span><span>Terminal</span></a>
+        <a href="#projects" data-route="projects"><span>⬡</span><span>Projects</span></a>
+        <a href="#ai" data-route="ai"><span>✦</span><span>AI</span></a>
+        <a href="#events" data-route="events"><span>≡</span><span>Events</span></a>
+      </nav>
+    </div>
+
+    <div class="palette" id="palette" hidden>
+      <div class="palette-card" role="dialog" aria-label="Command palette">
+        <input id="palette-input" placeholder="Jump to session, project, page…" autocomplete="off" />
+        <ul id="palette-list"></ul>
+        <div class="palette-foot">↑↓ navigate · ↵ open · esc close</div>
+      </div>
+    </div>
+
+    <div class="toasts" id="toasts" aria-live="polite"></div>
+
+    <script src="/vendor/xterm/xterm.js"></script>
+    <script src="/vendor/xterm-addon-fit/addon-fit.js"></script>
+    <script src="/vendor/xterm-addon-web-links/addon-web-links.js"></script>
+    <script src="/vendor/xterm-addon-search/addon-search.js"></script>
+    <script src="/vendor/xterm-addon-unicode11/addon-unicode11.js"></script>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

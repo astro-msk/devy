@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#18202b" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="stylesheet" href="/styles.css" />
+    <title>Mukil's Dev Agent Sessions</title>
+  </head>
+  <body>
+    <main>
+      <header class="topbar">
+        <div>
+          <h1>Mukil's Dev Agent</h1>
+          <p id="health">Connecting...</p>
+        </div>
+        <button id="refresh" type="button">Refresh</button>
+      </header>
+
+      <button id="update-banner" class="update-banner" type="button" hidden>Update available. Tap to reload.</button>
+
+      <section class="filters" aria-label="Session filters">
+        <button class="filter active" data-filter="all" type="button">All</button>
+        <button class="filter" data-filter="claude" type="button">Claude</button>
+        <button class="filter" data-filter="codex" type="button">Codex</button>
+        <button class="filter" data-filter="waiting_for_input" type="button">Needs input</button>
+      </section>
+
+      <section class="create-panel">
+        <details>
+          <summary>New tmux session</summary>
+          <form id="create-session-form">
+            <div class="field-row">
+              <label>
+                Agent
+                <select name="agent">
+                  <option value="codex">Codex</option>
+                  <option value="claude">Claude</option>
+                </select>
+              </label>
+              <label>
+                Name
+                <input name="name" autocomplete="off" placeholder="codex-feature-x" required />
+              </label>
+            </div>
+            <label>
+              Directory
+              <input name="directory" autocomplete="off" value="/home/ubuntu/apps" required />
+            </label>
+            <button type="submit">Create</button>
+          </form>
+        </details>
+      </section>
+
+      <section id="sessions" class="sessions" aria-live="polite"></section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

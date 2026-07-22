@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0e1422"/>
+      <stop offset="100%" stop-color="#06080c"/>
+    </linearGradient>
+    <radialGradient id="aurora1" cx="0.2" cy="0.18" r="0.85">
+      <stop offset="0%" stop-color="#7c8eff" stop-opacity="0.95"/>
+      <stop offset="60%" stop-color="#7c8eff" stop-opacity="0.0"/>
+    </radialGradient>
+    <radialGradient id="aurora2" cx="0.85" cy="0.9" r="0.8">
+      <stop offset="0%" stop-color="#50e3c2" stop-opacity="0.95"/>
+      <stop offset="60%" stop-color="#50e3c2" stop-opacity="0.0"/>
+    </radialGradient>
+    <radialGradient id="aurora3" cx="0.7" cy="0.2" r="0.5">
+      <stop offset="0%" stop-color="#ff8aa2" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#ff8aa2" stop-opacity="0.0"/>
+    </radialGradient>
+    <linearGradient id="prompt" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#50e3c2"/>
+      <stop offset="100%" stop-color="#7c8eff"/>
+    </linearGradient>
+    <linearGradient id="spark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#a3b1ff"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="512" height="512" rx="104" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="104" fill="url(#aurora1)"/>
+  <rect width="512" height="512" rx="104" fill="url(#aurora2)"/>
+  <rect width="512" height="512" rx="104" fill="url(#aurora3)"/>
+
+  <!-- Inner panel border for depth -->
+  <rect x="2" y="2" width="508" height="508" rx="102" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="2"/>
+
+  <!-- Soft window/frame to evoke a terminal pane -->
+  <rect x="68" y="98" width="376" height="316" rx="32" fill="rgba(8,11,16,0.55)" stroke="rgba(255,255,255,0.07)" stroke-width="1.5"/>
+
+  <!-- Traffic light dots -->
+  <circle cx="106" cy="132" r="7" fill="#ff6b81" opacity="0.85"/>
+  <circle cx="128" cy="132" r="7" fill="#f6b86b" opacity="0.85"/>
+  <circle cx="150" cy="132" r="7" fill="#50e3c2" opacity="0.95"/>
+
+  <!-- Prompt chevron + caret + spark -->
+  <g filter="url(#glow)">
+    <path d="M140 230 L208 280 L140 330" fill="none" stroke="url(#prompt)" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="236" y="316" width="124" height="20" rx="10" fill="url(#prompt)"/>
+  </g>
+
+  <!-- AI spark -->
+  <g transform="translate(360 188)" filter="url(#glow)">
+    <path d="M0 -34 L8 -8 L34 0 L8 8 L0 34 L-8 8 L-34 0 L-8 -8 Z" fill="url(#spark)"/>
+  </g>
+</svg>

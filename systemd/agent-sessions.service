@@ -1,0 +1,17 @@
+[Unit]
+Description=agent sessions PWA dashboard
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__AGENT_OPS_DIR__
+EnvironmentFile=/etc/agent-ops.env
+ExecStart=/usr/bin/npm run manager:start
+Restart=on-failure
+RestartSec=5
+User=ubuntu
+Group=ubuntu
+
+[Install]
+WantedBy=multi-user.target
