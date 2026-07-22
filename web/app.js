@@ -470,7 +470,7 @@ route("terminal", {
         <div class="terminal-wrap">
           <div class="terminal-bar">
             <div class="left">
-              <span class="dot on"></span>
+              <span class="term-status warn" id="term-status">connecting…</span>
               <strong id="term-title">${escapeHtml(State.selectedSession || "—")}</strong>
               <span class="badge" id="term-sub" style="font-size:10.5px;"></span>
             </div>
@@ -539,6 +539,8 @@ function bootTerminal() {
   $("#term-sub").textContent = meta ? `${meta.agent} · ${meta.git?.branch || ""}` : "";
 
   if (terminalState) {
+    clearTimeout(terminalState.reconnectTimer);
+    try { terminalState.ro?.disconnect(); } catch {/* */}
     try { terminalState.ws?.close(); } catch {/* */}
     try { terminalState.term?.dispose(); } catch {/* */}
     terminalState = null;
@@ -575,28 +577,61 @@ function bootTerminal() {
   fit.fit();
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?session=${encodeURIComponent(session)}`);
-  terminalState = { term, fit, ws, session, search: terminalState?.search };
+  const tokenParam = State.writeToken ? `&token=${encodeURIComponent(State.writeToken)}` : "";
+  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?session=${encodeURIComponent(session)}${tokenParam}`);
+  terminalState = { term, fit, ws, session, search: terminalState?.search, canWrite: false, reconnectAt: 0 };
+
+  const setStatus = (text, cls) => {
+    const el = $("#term-status");
+    if (el) { el.textContent = text; el.className = `term-status ${cls || ""}`; }
+  };
+  setStatus("connecting…", "warn");
 
   ws.onopen = () => {
+    setStatus("live", "on");
     ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
   };
   ws.onmessage = (ev) => {
     let payload;
     try { payload = JSON.parse(ev.data); } catch { return; }
+    if (payload.type === "ready") {
+      terminalState.canWrite = payload.canWrite;
+      setStatus(payload.canWrite ? "live" : "read-only", payload.canWrite ? "on" : "warn");
+      return;
+    }
     if (payload.type === "snapshot") {
-      // Reset + draw snapshot. We rely on tmux ANSI for colors.
-      term.write("\x1bc");
-      term.write(payload.output);
+      // Repaint the visible screen in place, wrapped in a DEC 2026 synchronized
+      // update so the terminal shows the whole frame at once (no flicker), then
+      // restore the real cursor position from tmux.
+      const cursor = payload.cursor || { x: 0, y: 0 };
+      const lines = payload.output.split("\n");
+      let frame = "\x1b[?2026h\x1b[H\x1b[2J\x1b[3J";
+      frame += lines.join("\r\n");
+      frame += `\x1b[${cursor.y + 1};${cursor.x + 1}H`;
+      frame += "\x1b[?2026l";
+      term.write(frame);
     } else if (payload.type === "error") {
-      term.writeln(`\r\n\x1b[31m[ws] ${payload.message}\x1b[0m`);
+      toast(payload.message, "error");
     }
   };
   ws.onclose = () => {
-    term.writeln("\r\n\x1b[2m[ws] disconnected\x1b[0m");
+    setStatus("disconnected", "bad");
+    // Auto-reconnect while the terminal page is still showing this session, so a
+    // phone waking from sleep reattaches without a manual refresh.
+    if (terminalState && terminalState.ws === ws && currentRoute().name === "terminal" && State.selectedSession === session) {
+      clearTimeout(terminalState.reconnectTimer);
+      terminalState.reconnectTimer = setTimeout(() => {
+        if (currentRoute().name === "terminal" && State.selectedSession === session) bootTerminal();
+      }, 1200);
+    }
   };
   term.onData((data) => {
-    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: "data", data }));
+    if (ws.readyState !== ws.OPEN) return;
+    if (!terminalState.canWrite) {
+      toast("Read-only. Save AGENT_OPS_TOKEN in Settings to type.", "error");
+      return;
+    }
+    ws.send(JSON.stringify({ type: "data", data }));
   });
   const ro = new ResizeObserver(() => {
     try { fit.fit(); if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows })); } catch {/* */}

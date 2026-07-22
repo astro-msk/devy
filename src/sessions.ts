@@ -23,7 +23,32 @@ export type ManagedSession = {
   git: GitStatus;
 };
 
-export async function listManagedSessions(): Promise<ManagedSession[]> {
+// Every browser tab polls /api/status every few seconds and the monitor polls
+// on its own timer. Each scan costs 3 tmux calls + 2 git calls per session, so
+// without this cache a handful of open tabs pins a core. Callers share one
+// in-flight scan and any result younger than SCAN_TTL_MS.
+const SCAN_TTL_MS = 1500;
+let scanCache: { at: number; sessions: ManagedSession[] } | null = null;
+let scanInFlight: Promise<ManagedSession[]> | null = null;
+
+export async function listManagedSessions(force = false): Promise<ManagedSession[]> {
+  if (!force && scanCache && Date.now() - scanCache.at < SCAN_TTL_MS) {
+    return scanCache.sessions;
+  }
+  if (scanInFlight) return scanInFlight;
+
+  scanInFlight = scanSessions()
+    .then((sessions) => {
+      scanCache = { at: Date.now(), sessions };
+      return sessions;
+    })
+    .finally(() => {
+      scanInFlight = null;
+    });
+  return scanInFlight;
+}
+
+async function scanSessions(): Promise<ManagedSession[]> {
   const sessions = await tmux([
     "list-sessions",
     "-F",
@@ -43,6 +68,10 @@ export async function listManagedSessions(): Promise<ManagedSession[]> {
   });
 }
 
+export function invalidateSessionCache(): void {
+  scanCache = null;
+}
+
 export async function createManagedSession(name: string, agent: "claude" | "codex", directory: string): Promise<void> {
   const resolved = safeProjectDirectory(directory);
 
@@ -51,10 +80,15 @@ export async function createManagedSession(name: string, agent: "claude" | "code
     throw new Error(`tmux session already exists: ${name}`);
   }
 
-  const result = await tmux(["new-session", "-d", "-s", name, "-c", resolved, agent]);
+  // `new-session -d -s NAME -c DIR agent` dies instantly if the agent binary is
+  // missing or exits, so the session vanishes and the UI shows nothing. Wrap it
+  // so the error stays on screen and the session drops to a shell instead.
+  const command = `${agent} || echo "[agent-ops] ${agent} exited with status $?"; exec bash -l`;
+  const result = await tmux(["new-session", "-d", "-s", name, "-c", resolved, "bash", "-lc", command]);
   if (result.code !== 0) {
     throw new Error(result.stderr || `failed to create ${agent} session`);
   }
+  invalidateSessionCache();
 }
 
 export async function activePaneDirectory(sessionName: string): Promise<string> {

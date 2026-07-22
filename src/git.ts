@@ -10,7 +10,31 @@ export type GitStatus = {
   unstagedCount: number;
 };
 
+const STATUS_TTL_MS = 4000;
+const statusCache = new Map<string, { at: number; status: GitStatus }>();
+const statusInFlight = new Map<string, Promise<GitStatus>>();
+
+// `git status --porcelain` on a large dirty repo is the slowest call in a
+// session scan, and the same directories repeat across sessions and projects.
 export async function getGitStatus(repoPath: string): Promise<GitStatus> {
+  const cached = statusCache.get(repoPath);
+  if (cached && Date.now() - cached.at < STATUS_TTL_MS) return cached.status;
+
+  const pending = statusInFlight.get(repoPath);
+  if (pending) return pending;
+
+  const run = readGitStatus(repoPath)
+    .then((status) => {
+      statusCache.set(repoPath, { at: Date.now(), status });
+      if (statusCache.size > 200) statusCache.clear();
+      return status;
+    })
+    .finally(() => statusInFlight.delete(repoPath));
+  statusInFlight.set(repoPath, run);
+  return run;
+}
+
+async function readGitStatus(repoPath: string): Promise<GitStatus> {
   const [branch, porcelain] = await Promise.all([
     git(repoPath, ["rev-parse", "--abbrev-ref", "HEAD"]),
     git(repoPath, ["status", "--porcelain"])

@@ -12,7 +12,7 @@ import {
 } from "./ai-memory.js";
 import { indexDigest } from "./repo-index.js";
 
-const DEFAULT_MODEL = process.env.AGENT_OPS_AI_MODEL || "claude-opus-4-7";
+const DEFAULT_MODEL = process.env.AGENT_OPS_AI_MODEL || "claude-opus-4-8";
 
 let client: Anthropic | null = null;
 function getClient(): Anthropic {
@@ -108,7 +108,9 @@ export async function streamAsk({ conversationId, message, res }: AskOptions): P
     const stream = await getClient().messages.stream({
       model: DEFAULT_MODEL,
       max_tokens: 4096,
-      system,
+      // The system prompt carries the repo + memory digest and is identical
+      // across turns in a conversation; caching it makes follow-ups cheap.
+      system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }],
       messages: history
     });
 

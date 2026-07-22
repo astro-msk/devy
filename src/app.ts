@@ -30,6 +30,7 @@ import { buildAllIndices } from "./repo-index.js";
 import {
   activePaneDirectory,
   createManagedSession,
+  invalidateSessionCache,
   listManagedSessions,
   tmux,
   tmuxKey,
@@ -117,7 +118,9 @@ export function createApp(): Express {
       time: new Date().toISOString(),
       hostname: os.hostname(),
       aiEnabled: aiConfigured(),
-      agentInputEnabled: process.env.ENABLE_AGENT_INPUT === "true"
+      agentInputEnabled: agentInputEnabled(),
+      tailscaleOnly: process.env.TAILSCALE_ONLY === "true",
+      tokenRequired: Boolean(process.env.AGENT_OPS_TOKEN)
     });
   });
 
@@ -151,20 +154,33 @@ export function createApp(): Express {
     res.setHeader("content-type", "text/event-stream");
     res.setHeader("cache-control", "no-cache, no-transform");
     res.setHeader("connection", "keep-alive");
+    res.setHeader("x-accel-buffering", "no");
     res.flushHeaders?.();
-    let lastSeen = Number(req.query.since ?? 0);
+
+    const since = Number(req.query.since);
+    // `since=0` would replay the last 50 events into a client that already has
+    // them, so an unusable `since` starts from the newest id instead.
+    let lastSeen = Number.isFinite(since) && since > 0 ? since : getRecentEvents(1)[0]?.id ?? 0;
+
     const tick = () => {
-      const events = getRecentEvents(50).filter((e) => e.id > lastSeen);
-      if (events.length) {
-        lastSeen = events[0].id;
-        for (const event of events.slice().reverse()) {
-          res.write(`event: event\ndata: ${JSON.stringify(event)}\n\n`);
-        }
+      const events = getRecentEvents(50).filter((event) => event.id > lastSeen);
+      if (!events.length) return;
+      lastSeen = events[0].id;
+      for (const event of events.slice().reverse()) {
+        res.write(`id: ${event.id}\nevent: event\ndata: ${JSON.stringify(event)}\n\n`);
       }
     };
-    tick();
-    const interval = setInterval(tick, 2500);
-    req.on("close", () => clearInterval(interval));
+
+    const interval = setInterval(tick, 2000);
+    // Comment frames keep the connection from being reaped by idle timeouts and
+    // let the client notice a dead server instead of silently going quiet.
+    const keepAlive = setInterval(() => res.write(`: ping ${Date.now()}\n\n`), 20000);
+    const stop = () => {
+      clearInterval(interval);
+      clearInterval(keepAlive);
+    };
+    req.on("close", stop);
+    res.on("close", stop);
   });
 
   app.post("/api/events", requireWriteAuth, async (req, res) => {
@@ -178,7 +194,7 @@ export function createApp(): Express {
   });
 
   app.post("/api/agents/:agent/input", requireWriteAuth, async (req, res) => {
-    if (process.env.ENABLE_AGENT_INPUT !== "true") {
+    if (!agentInputEnabled()) {
       res.status(403).json({ ok: false, error: "agent input is disabled" });
       return;
     }
@@ -217,6 +233,10 @@ export function createApp(): Express {
       res.status(400).json({ ok: false, error: "invalid session or input" });
       return;
     }
+    if (!agentInputEnabled()) {
+      res.status(403).json({ ok: false, error: "agent input is disabled (ENABLE_AGENT_INPUT=false)" });
+      return;
+    }
     try {
       await sendSessionInput(sessionName, input.data.text, input.data.submit, "browser");
       res.status(201).json({ ok: true });
@@ -251,7 +271,8 @@ export function createApp(): Express {
     }
     try {
       const result = await tmux(["kill-session", "-t", sessionName]);
-      if (result.code !== 0) throw new Error(result.stderr || "tmux kill-session failed");
+      if (result.code !== 0) throw new Error(result.stderr.trim() || "tmux kill-session failed");
+      invalidateSessionCache();
       res.json({ ok: true });
     } catch (error) {
       res.status(400).json({ ok: false, error: (error as Error).message });
@@ -304,7 +325,7 @@ export function createApp(): Express {
 
   // ─── AI assistant ─────────────────────────────────────────────────────────
   app.get("/api/ai/status", (_req, res) => {
-    res.json({ enabled: aiConfigured(), model: process.env.AGENT_OPS_AI_MODEL || "claude-opus-4-7" });
+    res.json({ enabled: aiConfigured(), model: process.env.AGENT_OPS_AI_MODEL || "claude-opus-4-8" });
   });
 
   app.post("/api/ai/ask", requireWriteAuth, async (req, res) => {
@@ -363,11 +384,32 @@ export function createApp(): Express {
   });
 
   app.use(express.static(webDir, { index: "index.html", extensions: ["html"] }));
+
+  // Unknown /api/* paths used to fall through to index.html, so a typo'd fetch
+  // resolved with an HTML body and failed later at JSON.parse.
+  app.use("/api", (_req, res) => {
+    res.status(404).json({ ok: false, error: "unknown endpoint" });
+  });
+
   app.get(/.*/, (_req, res) => {
     res.sendFile(path.join(webDir, "index.html"));
   });
 
+  // Without this, a throw inside any handler yields Express's HTML error page
+  // (or a hung request), which the client surfaces as an unparseable response.
+  app.use((error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.error("[agent-ops] unhandled request error:", error);
+    if (res.headersSent) return;
+    res.status(500).json({ ok: false, error: error.message || "internal error" });
+  });
+
   return app;
+}
+
+// Every write path already requires auth; this switch exists to hard-disable
+// typing into agents. Unset means enabled — the dashboard is useless read-only.
+function agentInputEnabled(): boolean {
+  return process.env.ENABLE_AGENT_INPUT !== "false";
 }
 
 async function readProjectPermissions(directory: string): Promise<unknown> {
@@ -476,26 +518,38 @@ function safeProjectDirectory(directory: string): string {
 }
 
 async function getSystemStats(): Promise<unknown> {
-  const disk = await statfs(process.env.REPO_PATH || process.cwd());
   const cpus = os.cpus();
   const load = os.loadavg();
   const totalMem = os.totalmem();
   const freeMem = os.freemem();
+  const diskPath = process.env.REPO_PATH || process.cwd();
+
+  let disk: unknown = null;
+  try {
+    const stats = await statfs(diskPath);
+    disk = {
+      path: diskPath,
+      total: stats.blocks * stats.bsize,
+      free: stats.bavail * stats.bsize,
+      usedPercent: Math.round(((stats.blocks - stats.bavail) / stats.blocks) * 100)
+    };
+  } catch {
+    disk = { path: diskPath, total: 0, free: 0, usedPercent: 0 };
+  }
+
   return {
     hostname: os.hostname(),
     uptimeSeconds: os.uptime(),
     load1: load[0],
+    // Load average alone is meaningless without knowing the core count; expose
+    // the normalized ratio so the UI can colour it sensibly.
+    loadPercent: cpus.length ? Math.min(100, Math.round((load[0] / cpus.length) * 100)) : 0,
     cpuCount: cpus.length,
     memory: {
       total: totalMem,
       free: freeMem,
       usedPercent: Math.round(((totalMem - freeMem) / totalMem) * 100)
     },
-    disk: {
-      path: process.env.REPO_PATH || process.cwd(),
-      total: disk.blocks * disk.bsize,
-      free: disk.bavail * disk.bsize,
-      usedPercent: Math.round(((disk.blocks - disk.bavail) / disk.blocks) * 100)
-    }
+    disk
   };
 }
