@@ -14,9 +14,11 @@ export type MemoryEntry = {
   updatedAt: string;
 };
 
+// content is a plain string for simple chat, or an array of Anthropic content
+// blocks (text / tool_use / tool_result) for agentic turns.
 export type ConversationTurn = {
   role: "user" | "assistant";
-  content: string;
+  content: string | unknown[];
   ts: string;
 };
 

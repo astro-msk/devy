@@ -11,8 +11,10 @@ import {
   type Conversation
 } from "./ai-memory.js";
 import { indexDigest } from "./repo-index.js";
+import { agentToolsEnabled, runTool, toolDefinitions } from "./agent-tools.js";
 
 const DEFAULT_MODEL = process.env.AGENT_OPS_AI_MODEL || "claude-opus-4-8";
+const MAX_TOOL_ITERATIONS = 40;
 
 let client: Anthropic | null = null;
 function getClient(): Anthropic {
@@ -31,14 +33,27 @@ export function aiConfigured(): boolean {
 
 export async function buildSystemPrompt(): Promise<string> {
   const [memories, repos] = await Promise.all([memoryDigest(30), indexDigest(16000)]);
-  return [
-    "You are Mukil's personal repo assistant inside agent-ops. You help reason about two repositories:",
+  const toolsOn = agentToolsEnabled();
+  const lines = [
+    "You are Mukil's agentic operator inside agent-ops, running on his dev server (host: devy, user: ubuntu).",
+    "You help with two repositories:",
     " - Pilot: HVAC backoffice browser-agent framework at /home/ubuntu/work/repos/Pilot",
     " - Crucible: AI agent studio (FastAPI backend + RN mobile app) at /home/ubuntu/work/repos/Crucible",
-    "",
-    "Be concise, technically precise, and opinionated. Cite specific paths (file.py:line) when relevant.",
-    "When the user shares a preference or insight worth remembering for later sessions, suggest saving it as a memory.",
-    "If the user asks for changes, propose the smallest correct diff. Never invent file paths or APIs.",
+    ""
+  ];
+  if (toolsOn) {
+    lines.push(
+      "You have real tools and act like Claude Code: run `bash`, `read_file`, and `write_file` to inspect and change anything on the box, and use `list_sessions` / `capture_session` / `send_session` to observe and unblock the OTHER Claude Code / Codex agents running in tmux. Prefer acting over guessing — when a question is answerable by running a command, run it. Chain tools until the task is actually done, then report the outcome first, concisely.",
+      "Safety: you run as a non-root user behind Tailscale. Reversible actions: just do them. Irreversible or wide-blast-radius actions (deleting many files, killing production services, force-pushing, editing another agent's work): describe what you'll do and why before doing it. Never run destructive commands to 'clean up' unless asked.",
+      "When you edit files, make the smallest correct change and say what you changed. Verify your work (build/test/inspect) when practical."
+    );
+  } else {
+    lines.push(
+      "Tools are currently disabled (ENABLE_AGENT_TOOLS=false), so answer from context only. Be concise, technically precise, and opinionated. Cite specific paths (file.py:line) when relevant."
+    );
+  }
+  lines.push(
+    "When the user shares a preference or insight worth remembering, suggest saving it as a memory (/remember).",
     "Match the user's terseness — a short answer for short questions.",
     "",
     "## Persistent memory (your notes from prior chats)",
@@ -46,7 +61,8 @@ export async function buildSystemPrompt(): Promise<string> {
     "",
     "## Repository snapshots (cached every 60s from disk)",
     repos
-  ].join("\n");
+  );
+  return lines.join("\n");
 }
 
 type AskOptions = {
@@ -101,38 +117,122 @@ export async function streamAsk({ conversationId, message, res }: AskOptions): P
   }
 
   const system = await buildSystemPrompt();
-  const history = conversation.turns.map((t) => ({ role: t.role, content: t.content }));
+  const toolsOn = agentToolsEnabled();
+  // The API needs full content blocks (tool_use/tool_result) preserved across
+  // turns, so run the loop on a working copy and persist the new turns after.
+  const work: Array<{ role: "user" | "assistant"; content: string | unknown[] }> = conversation.turns.map(
+    (t) => ({ role: t.role, content: t.content })
+  );
+  const baseLength = work.length;
+  let lastText = "";
 
-  let assistantText = "";
+  const client = getClient();
+  const clientClosed = { value: false };
+  res.on("close", () => {
+    clientClosed.value = true;
+  });
+
   try {
-    const stream = await getClient().messages.stream({
-      model: DEFAULT_MODEL,
-      max_tokens: 4096,
-      // The system prompt carries the repo + memory digest and is identical
-      // across turns in a conversation; caching it makes follow-ups cheap.
-      system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }],
-      messages: history
-    });
+    for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
+      if (clientClosed.value) break;
+      let streamedText = "";
+      const stream = client.messages.stream({
+        model: DEFAULT_MODEL,
+        max_tokens: 16000,
+        // Adaptive thinking sharpens the tool-use decisions; the system prompt
+        // carries the repo + memory digest and is stable, so cache it.
+        thinking: toolsOn ? { type: "adaptive" } : undefined,
+        system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }],
+        // Client tools (bash/files/tmux) plus Anthropic's server-side web search
+        // so the assistant can look things up online mid-task.
+        tools: toolsOn
+          ? ([...toolDefinitions(), { type: "web_search_20260209", name: "web_search", max_uses: 5 }] as Anthropic.ToolUnion[])
+          : undefined,
+        messages: work as Anthropic.MessageParam[]
+      });
 
-    for await (const event of stream) {
-      if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
-        assistantText += event.delta.text;
-        send("delta", { text: event.delta.text });
+      for await (const event of stream) {
+        if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+          streamedText += event.delta.text;
+          send("delta", { text: event.delta.text });
+        } else if (event.type === "content_block_start") {
+          const block = event.content_block;
+          if (block.type === "tool_use") {
+            // Surface the tool call as soon as the model commits to it.
+            send("tool_start", { id: block.id, name: block.name });
+          } else if (block.type === "server_tool_use") {
+            send("tool_start", { id: block.id, name: block.name });
+          }
+        }
       }
+
+      const finalMessage = await stream.finalMessage();
+      if (finalMessage.usage) {
+        send("usage", {
+          input: finalMessage.usage.input_tokens,
+          output: finalMessage.usage.output_tokens,
+          cacheRead: finalMessage.usage.cache_read_input_tokens ?? 0
+        });
+      }
+      if (streamedText.trim()) lastText = streamedText;
+
+      // Keep the full content (incl. thinking) in the live loop so the model
+      // sees its own reasoning; strip thinking only when persisting.
+      work.push({ role: "assistant", content: finalMessage.content });
+
+      if (finalMessage.stop_reason === "pause_turn") {
+        // Server tool (e.g. web search) hit its per-turn limit; resume.
+        continue;
+      }
+      if (finalMessage.stop_reason !== "tool_use") break;
+
+      const toolUses = finalMessage.content.filter(
+        (block): block is Anthropic.ToolUseBlock => block.type === "tool_use"
+      );
+      const toolResults: Anthropic.ToolResultBlockParam[] = [];
+      for (const call of toolUses) {
+        send("tool_use", { id: call.id, name: call.name, input: call.input });
+        const result = await runTool(call.name, call.input, {
+          onOutput: (chunk) => send("tool_output", { id: call.id, chunk })
+        });
+        send("tool_result", { id: call.id, isError: result.isError, content: result.content });
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: call.id,
+          content: result.content,
+          is_error: result.isError
+        });
+      }
+      work.push({ role: "user", content: toolResults });
     }
   } catch (error) {
-    const msg = (error as Error).message;
+    const msg = friendlyApiError((error as Error).message);
     send("error", { message: msg });
-    assistantText = assistantText || `Error from Anthropic API: ${msg}`;
+    if (!lastText) lastText = msg;
   }
 
-  conversation.turns.push({ role: "assistant", content: assistantText, ts: new Date().toISOString() });
+  // Persist every new turn from this exchange, dropping thinking blocks (they
+  // are display-only and other models ignore them on resume).
+  const now = new Date().toISOString();
+  for (const turn of work.slice(baseLength)) {
+    conversation.turns.push({ role: turn.role, content: stripThinking(turn.content), ts: now });
+  }
   if (conversation.title === "New chat" || conversation.title === deriveTitle(message)) {
     conversation.title = deriveTitle(message);
   }
   await saveConversation(conversation);
   send("done", { conversationId: conversation.id });
   res.end();
+}
+
+// Thinking blocks must stay in the live loop (same-model replay) but are noise
+// in persisted history, so remove them before saving.
+function stripThinking(content: string | unknown[]): string | unknown[] {
+  if (!Array.isArray(content)) return content;
+  return content.filter((block) => {
+    const type = (block as { type?: string })?.type;
+    return type !== "thinking" && type !== "redacted_thinking";
+  });
 }
 
 async function interceptSlashCommand(message: string): Promise<{ text: string; memory?: { id: string; topic: string } } | null> {
@@ -173,12 +273,31 @@ async function interceptSlashCommand(message: string): Promise<{ text: string; m
         "- `/forget <id>` — delete a memory by id",
         "- `/help` — this message",
         "",
-        "Anything else is sent to Anthropic with Pilot + Crucible context attached."
+        "Anything else goes to the agent, which can run **bash**, **read/write files**, **search the web**, and **observe & unblock your other tmux agents** (`list_sessions`, `capture_session`, `send_session`) — with Pilot + Crucible context attached."
       ].join("\n")
     };
   }
 
   return null;
+}
+
+// The raw SDK errors are JSON blobs; translate the ones that actually happen in
+// this deployment into one-line guidance the phone UI can show.
+function friendlyApiError(raw: string): string {
+  const lower = raw.toLowerCase();
+  if (lower.includes("credit balance is too low")) {
+    return "Anthropic API credit balance is too low. Top up at console.anthropic.com (Billing), then retry — no code change needed.";
+  }
+  if (lower.includes("authentication") || lower.includes("invalid x-api-key") || lower.includes("401")) {
+    return "ANTHROPIC_API_KEY is invalid or expired. Update it in /etc/agent-ops.env and restart agent-ops.";
+  }
+  if (lower.includes("rate_limit") || lower.includes("429")) {
+    return "Anthropic API rate limit hit. Wait a moment and retry.";
+  }
+  if (lower.includes("overloaded") || lower.includes("529")) {
+    return "Anthropic API is overloaded right now. Retry shortly.";
+  }
+  return `Anthropic API error: ${raw}`;
 }
 
 function deriveTitle(message: string): string {

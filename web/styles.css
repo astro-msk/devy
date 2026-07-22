@@ -571,6 +571,45 @@ label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color:
 .ai-turn.user .body { background: var(--accent-2-soft); border-color: rgba(124,142,255,0.25); }
 .ai-turn .body code { background: var(--bg-3); padding: 1px 6px; border-radius: 4px; font-family: var(--font-mono); font-size: 12.5px; }
 .ai-turn .body pre { background: var(--bg-0); padding: 10px 12px; border-radius: var(--radius-sm); border: 1px solid var(--border); overflow: auto; font-family: var(--font-mono); font-size: 12.5px; }
+.ai-turn .body a { color: var(--accent-2); }
+.ai-agent-block { margin-bottom: 14px; }
+.ai-agent-block .ai-turn { margin-bottom: 8px; }
+.ai-error { color: var(--hot); font-family: var(--font-mono); font-size: 12.5px; }
+
+/* Agent tool-call cards */
+.tool-card {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg-1); margin: 8px 0; overflow: hidden;
+}
+.tool-card.running { border-color: rgba(246,184,107,0.35); }
+.tool-card.error { border-color: rgba(255,107,129,0.4); }
+.tool-card.done { border-color: rgba(80,227,194,0.3); }
+.tool-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 11px; font-family: var(--font-mono); font-size: 12.5px;
+  background: var(--bg-2); border-bottom: 1px solid var(--border);
+}
+.tool-icon { color: var(--accent); }
+.tool-name { font-weight: 600; color: var(--text); }
+.tool-label {
+  color: var(--muted); flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tool-status {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
+  padding: 2px 8px; border-radius: 999px; background: var(--bg-3); color: var(--muted);
+}
+.tool-status.running { color: var(--warn); }
+.tool-status.done { color: var(--ok); }
+.tool-status.error { color: var(--hot); }
+.tool-body:empty { display: none; }
+.tool-output {
+  margin: 0; padding: 10px 12px; max-height: 320px; overflow: auto;
+  background: var(--bg-0); font-family: var(--font-mono); font-size: 12px;
+  line-height: 1.5; white-space: pre-wrap; word-break: break-word; color: var(--text-dim);
+}
+.ai-usage { color: var(--muted); font-family: var(--font-mono); font-size: 11.5px; }
+
 .ai-composer {
   display: flex; gap: 8px; padding: 12px;
   padding-bottom: calc(12px + var(--safe-bot));

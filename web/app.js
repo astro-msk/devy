@@ -831,9 +831,9 @@ route("ai", {
           <div id="ai-conv-list">${spinnerHTML()}</div>
         </div>
         <div class="ai-conv">
-          <div class="ai-stream" id="ai-stream"><div class="empty"><h3>Ask anything about Pilot or Crucible</h3><p>Try “explain the workflow executor in Pilot”, or save a note with <code>/remember always run mypy on Pilot before commit</code>. Type <code>/help</code> for commands.</p></div></div>
+          <div class="ai-stream" id="ai-stream"><div class="empty"><h3>Agentic operator for this box</h3><p>It can run shell commands, read/write files, search the web, and drive your other tmux agents. Try “what’s eating disk in ~/work?”, “tail the agent-ops logs and tell me if anything’s wrong”, or “check what claude-pilot-1 is stuck on and unblock it”. <code>/remember</code> saves a note; <code>/help</code> lists commands.</p></div></div>
           <form class="ai-composer" id="ai-composer">
-            <textarea name="message" placeholder="Ask, or /remember &lt;note&gt; · /memories · /forget &lt;id&gt; · ⌘↩ to send" required></textarea>
+            <textarea name="message" placeholder="Ask or tell the agent to do something · ⌘↩ to send" required></textarea>
             <button class="btn btn-primary" type="submit">Send</button>
           </form>
         </div>
@@ -909,20 +909,100 @@ function renderStream(conv) {
     stream.innerHTML = `<div class="empty"><h3>Empty conversation</h3><p>Say something.</p></div>`;
     return;
   }
-  stream.innerHTML = conv.turns.map(renderTurn).join("");
+  stream.innerHTML = itemsFromTurns(conv.turns).map(renderItem).join("");
   stream.scrollTop = stream.scrollHeight;
 }
 
-function renderTurn(turn) {
-  return `<div class="ai-turn ${turn.role}"><div class="role">${turn.role}</div><div class="body">${renderMarkdownish(turn.content)}</div></div>`;
+// Flatten stored turns (strings or content-block arrays) into a linear list of
+// display items: user/assistant text bubbles and tool cards. tool_result blocks
+// live in a later user turn, so we match them back to their tool_use by id.
+function itemsFromTurns(turns) {
+  const items = [];
+  const toolsById = {};
+  for (const turn of turns) {
+    const content = turn.content;
+    if (typeof content === "string") {
+      if (content.trim()) items.push({ kind: "text", role: turn.role, text: content });
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block.type === "text" && block.text) {
+        items.push({ kind: "text", role: turn.role, text: block.text });
+      } else if (block.type === "tool_use" || block.type === "server_tool_use") {
+        // A persisted server tool (web_search) always completed; client tools
+        // are marked done when their tool_result block is found below.
+        const item = { kind: "tool", id: block.id, name: block.name, input: block.input, output: "", done: block.type === "server_tool_use", isError: false };
+        toolsById[block.id] = item;
+        items.push(item);
+      } else if (block.type === "tool_result") {
+        const item = toolsById[block.tool_use_id];
+        if (item) {
+          item.output = blockText(block.content);
+          item.done = true;
+          item.isError = Boolean(block.is_error);
+        }
+      }
+    }
+  }
+  return items;
+}
+
+function blockText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map((b) => (typeof b === "string" ? b : b.text || "")).join("");
+  return "";
+}
+
+function renderItem(item) {
+  if (item.kind === "text") {
+    return `<div class="ai-turn ${item.role}"><div class="role">${item.role === "user" ? "you" : "agent"}</div><div class="body">${renderMarkdownish(item.text)}</div></div>`;
+  }
+  return toolCardHTML(item);
+}
+
+const toolIcons = {
+  bash: "⌘", read_file: "◇", write_file: "✎", list_sessions: "▤",
+  capture_session: "▣", send_session: "➤", web_search: "⌕",
+};
+
+function toolCardHTML(item) {
+  const icon = toolIcons[item.name] || "•";
+  const label = toolLabel(item);
+  const status = !item.done ? "running" : item.isError ? "error" : "done";
+  const statusText = !item.done ? "running…" : item.isError ? "error" : "done";
+  const output = (item.output || "").trim();
+  const body = output ? `<pre class="tool-output">${escapeHtml(output.slice(-6000))}</pre>` : "";
+  return `
+    <div class="tool-card ${status}" data-tool="${escapeHtml(item.id)}">
+      <div class="tool-head">
+        <span class="tool-icon">${icon}</span>
+        <span class="tool-name">${escapeHtml(item.name)}</span>
+        <span class="tool-label">${escapeHtml(label)}</span>
+        <span class="tool-status ${status}">${statusText}</span>
+      </div>
+      <div class="tool-body">${body}</div>
+    </div>
+  `;
+}
+
+function toolLabel(item) {
+  const i = item.input || {};
+  if (item.name === "bash") return i.command || "";
+  if (item.name === "read_file" || item.name === "write_file") return i.path || "";
+  if (item.name === "capture_session" || item.name === "send_session") return i.session || "";
+  if (item.name === "web_search") return i.query || "";
+  return "";
 }
 
 function renderMarkdownish(text) {
-  // Minimal markdown-ish: ```code``` and `inline` and bold.
+  // Minimal markdown-ish: fenced code, inline code, bold, headings, links.
   let s = escapeHtml(text);
-  s = s.replace(/```([\s\S]*?)```/g, (_, code) => `<pre>${code}</pre>`);
-  s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
-  s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/```(?:\w+)?\n?([\s\S]*?)```/g, (_, code) => `<pre>${code.replace(/\n$/, "")}</pre>`);
+  s = s.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/^###?\s+(.+)$/gm, "<strong>$1</strong>");
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
   return s;
 }
 
@@ -955,14 +1035,45 @@ async function aiSubmit(e) {
       renderConvList();
     } catch (error) { toast(error.message, "error"); return; }
   }
-  conv.turns.push({ role: "user", content: message, ts: new Date().toISOString() });
-  conv.turns.push({ role: "assistant", content: "", ts: new Date().toISOString() });
-  renderStream(conv);
-  const assistantTurn = conv.turns[conv.turns.length - 1];
   const stream = $("#ai-stream");
-  const lastBody = stream.querySelector(".ai-turn:last-child .body");
+  // Clear the empty-state placeholder on the first message.
+  if (stream.querySelector(".empty")) stream.innerHTML = "";
+  stream.insertAdjacentHTML("beforeend", `<div class="ai-turn user"><div class="role">you</div><div class="body">${renderMarkdownish(message)}</div></div>`);
 
-  // POST and parse SSE manually so we can include Bearer header.
+  // Live agent output: a growing assistant text node plus one card per tool.
+  const agentBlock = h(`<div class="ai-agent-block"></div>`);
+  stream.appendChild(agentBlock);
+  const scroll = () => { stream.scrollTop = stream.scrollHeight; };
+  scroll();
+
+  let textNode = null;
+  let accumulatedText = "";
+  const cards = {};
+  const ensureText = () => {
+    if (!textNode) {
+      textNode = h(`<div class="ai-turn assistant"><div class="role">agent</div><div class="body"></div></div>`);
+      agentBlock.appendChild(textNode);
+    }
+    return textNode.querySelector(".body");
+  };
+  const ensureCard = (id, name) => {
+    if (cards[id]) return cards[id];
+    const item = { id, name, input: {}, output: "", done: false, isError: false };
+    const node = h(toolCardHTML(item));
+    agentBlock.appendChild(node);
+    cards[id] = { item, node };
+    // Next assistant text after a tool goes into a fresh node below the card.
+    textNode = null;
+    return cards[id];
+  };
+  const refreshCard = (id) => {
+    const entry = cards[id];
+    if (!entry) return;
+    const fresh = h(toolCardHTML(entry.item));
+    entry.node.replaceWith(fresh);
+    entry.node = fresh;
+  };
+
   const headers = { "content-type": "application/json" };
   if (State.writeToken) headers.authorization = `Bearer ${State.writeToken}`;
   const res = await fetch("/api/ai/ask", {
@@ -971,13 +1082,57 @@ async function aiSubmit(e) {
     body: JSON.stringify({ message, conversationId: conv.id }),
   });
   if (res.status === 401) {
+    agentBlock.remove();
     const t = await promptToken();
     if (t) { State.writeToken = t; localStorage.setItem("agentOpsToken", t); aiSubmit(e); }
     return;
   }
+  if (!res.ok || !res.body) {
+    ensureText().innerHTML = `<span class="ai-error">Request failed (${res.status})</span>`;
+    return;
+  }
+
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  const handle = (event, payload) => {
+    if (event === "delta") {
+      accumulatedText += payload.text;
+      ensureText().innerHTML = renderMarkdownish(accumulatedText);
+    } else if (event === "tool_start") {
+      ensureCard(payload.id, payload.name);
+      accumulatedText = "";
+    } else if (event === "tool_use") {
+      const entry = ensureCard(payload.id, payload.name);
+      entry.item.input = payload.input || {};
+      refreshCard(payload.id);
+    } else if (event === "tool_output") {
+      const entry = cards[payload.id];
+      if (entry) { entry.item.output += payload.chunk; refreshCard(payload.id); }
+    } else if (event === "tool_result") {
+      const entry = ensureCard(payload.id, "tool");
+      if (payload.content) entry.item.output = payload.content;
+      entry.item.done = true;
+      entry.item.isError = payload.isError;
+      refreshCard(payload.id);
+    } else if (event === "usage") {
+      updateUsage(payload);
+    } else if (event === "memory") {
+      toast(`Remembered: ${payload.topic}`, "ok");
+      loadMemories();
+    } else if (event === "error") {
+      toast(payload.message, "error");
+      ensureText().insertAdjacentHTML("beforeend", `<div class="ai-error">${escapeHtml(payload.message)}</div>`);
+    } else if (event === "done") {
+      // Server tools (web_search) never send a tool_result; settle their cards.
+      for (const id in cards) {
+        if (!cards[id].item.done) { cards[id].item.done = true; refreshCard(id); }
+      }
+      loadConversations();
+    }
+    scroll();
+  };
+
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -991,20 +1146,21 @@ async function aiSubmit(e) {
       if (!eventMatch || !dataMatch) continue;
       let payload;
       try { payload = JSON.parse(dataMatch[1]); } catch { continue; }
-      if (eventMatch[1] === "delta") {
-        assistantTurn.content += payload.text;
-        lastBody.innerHTML = renderMarkdownish(assistantTurn.content);
-        stream.scrollTop = stream.scrollHeight;
-      } else if (eventMatch[1] === "memory") {
-        toast(`Remembered: ${payload.topic}`, "ok");
-        loadMemories();
-      } else if (eventMatch[1] === "error") {
-        toast(payload.message, "error");
-      } else if (eventMatch[1] === "done") {
-        loadConversations();
-      }
+      handle(eventMatch[1], payload);
     }
   }
+}
+
+function updateUsage(u) {
+  let el = $("#ai-usage");
+  if (!el) {
+    const head = $(".page-head .sub");
+    if (!head) return;
+    el = h(`<span id="ai-usage" class="ai-usage"></span>`);
+    head.appendChild(el);
+  }
+  const total = (updateUsage.total = (updateUsage.total || 0) + (u.output || 0));
+  el.textContent = ` · ${total} out tok`;
 }
 
 async function loadMemories(q = "") {
