@@ -1,4 +1,4 @@
-const CACHE_NAME = "agent-ops-v13";
+const CACHE_NAME = "agent-ops-v14";
 const ASSETS = ["/", "/index.html", "/styles.css", "/app.js", "/manifest.json", "/icon.svg"];
 
 self.addEventListener("install", (event) => {

@@ -12,6 +12,7 @@ const State = {
   memories: [],
   currentConv: null,
   filter: "all",
+  eventFilter: "all",
   selectedSession: localStorage.getItem("agentOpsSelectedSession") || null,
   seenHashes: JSON.parse(localStorage.getItem("agentOpsSeen") || "{}"),
   notifySound: localStorage.getItem("agentOpsNotifySound") !== "false",
@@ -55,6 +56,17 @@ function relTime(iso) {
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
   return `${Math.floor(diff / 86400)}d ago`;
+}
+
+// Compact duration for "how long has this agent been in this state", from an
+// epoch-ms timestamp. e.g. 45s · 4m · 2h · 3d.
+function durSince(ms) {
+  if (!ms) return "";
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  if (s < 60) return `${Math.floor(s)}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
 }
 
 function formatUptime(seconds) {
@@ -342,6 +354,13 @@ function renderSessionCard(s) {
   const dirtyChip = s.git?.dirty
     ? `<span class="meta-chip warn">dirty${s.git.unstagedCount ? ` · ${s.git.unstagedCount}` : ""}${s.git.stagedCount ? ` · ${s.git.stagedCount} staged` : ""}</span>`
     : (s.git?.branch ? `<span class="meta-chip ok">clean</span>` : "");
+  const cmdChip = s.paneCommand && s.paneCommand !== "unknown"
+    ? `<span class="meta-chip muted" title="pane command">${escapeHtml(s.paneCommand)}</span>` : "";
+  // "how long in this state", derived from tmux session_activity.
+  const dur = durSince(s.lastActivity);
+  const whenVerb = { waiting_for_input: "waiting", error: "error", idle: "idle", running: "active" }[s.state] || "";
+  const whenClass = s.state === "waiting_for_input" ? "warn" : s.state === "error" ? "bad" : "";
+  const whenHtml = dur ? `<span class="card-when ${whenClass}" title="last activity ${relTime(s.lastActivity ? new Date(s.lastActivity).toISOString() : "")}">${whenVerb} ${dur}</span>` : "";
   return `
     <article class="session-card ${attention}" data-state="${s.state}">
       <div class="card-top">
@@ -350,13 +369,16 @@ function renderSessionCard(s) {
           <h3>${escapeHtml(s.name)}</h3>
           <span class="badge ${s.agent}">${escapeHtml(s.agent)}</span>
         </div>
-        <span class="badge ${s.state}">${stateLabels[s.state] || s.state}</span>
+        <div class="card-status">
+          <span class="badge ${s.state}">${stateLabels[s.state] || s.state}</span>
+          ${whenHtml}
+        </div>
       </div>
       <div class="card-sub">
         <span class="meta-chip">${escapeHtml(repoName)}</span>
         <span class="meta-chip">${escapeHtml(branch)}</span>
         ${dirtyChip}
-        <span class="meta-chip muted" title="pane command">${escapeHtml(s.paneCommand || "?")}</span>
+        ${cmdChip}
       </div>
       <div class="card-path" title="${escapeHtml(s.paneCurrentPath || "")}">${escapeHtml(s.paneCurrentPath || "")}</div>
       <pre class="preview">${escapeHtml(tail || "(no recent output)")}</pre>
@@ -806,13 +828,52 @@ route("events", {
           <button class="btn" id="events-refresh">Refresh</button>
         </div>
       </div>
+      <div class="chip-row" id="event-filters">
+        ${eventFilters.map((f) => `<button class="chip ${State.eventFilter === f.key ? "active" : ""}" data-filter="${f.key}">${f.label}</button>`).join("")}
+      </div>
       <div class="panel" id="events-panel">${spinnerHTML()}</div>
     `;
+    $("#event-filters").addEventListener("click", (e) => {
+      const chip = e.target.closest("[data-filter]");
+      if (!chip) return;
+      State.eventFilter = chip.dataset.filter;
+      $$("#event-filters .chip").forEach((c) => c.classList.toggle("active", c.dataset.filter === State.eventFilter));
+      renderEvents();
+    });
     $("#events-refresh").addEventListener("click", loadEvents);
     loadEvents();
     startEventStream();
   },
 });
+
+// Classify an event into a display "kind" — the raw type is coarse (most things
+// are "notification"), so we also sniff the message to separate the ones that
+// actually want you (input/permission) from ambient chatter.
+const eventFilters = [
+  { key: "all", label: "All" },
+  { key: "attention", label: "Needs you" },
+  { key: "error", label: "Errors" },
+  { key: "ok", label: "Done" },
+  { key: "info", label: "Info" },
+];
+function eventKind(e) {
+  if (e.type === "error") return "error";
+  if (e.type === "completed") return "ok";
+  if (e.type === "approval_required" || /waiting for your input|needs your (permission|approval|input)|approval for/i.test(e.message || "")) return "attention";
+  if (e.type === "info") return "info";
+  return "info";
+}
+const eventIcons = { attention: "⚠", error: "✕", ok: "✓", info: "•" };
+
+function eventDayLabel(iso) {
+  const d = new Date((iso || "").includes("T") ? (iso.endsWith("Z") ? iso : iso + "Z") : iso + "Z");
+  const now = new Date();
+  const sameDay = (a, b) => a.toDateString() === b.toDateString();
+  if (sameDay(d, now)) return "Today";
+  const y = new Date(now); y.setDate(now.getDate() - 1);
+  if (sameDay(d, y)) return "Yesterday";
+  return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+}
 
 async function loadEvents() {
   const panel = $("#events-panel");
@@ -829,18 +890,43 @@ async function loadEvents() {
 function renderEvents() {
   const panel = $("#events-panel");
   if (!panel) return;
-  if (!State.events.length) {
-    panel.innerHTML = `<div class="empty"><h3>No events yet</h3><p>Hooks and the tmux monitor will appear here.</p></div>`;
+  const filtered = State.events.filter((e) => State.eventFilter === "all" || eventKind(e) === State.eventFilter);
+  if (!filtered.length) {
+    const msg = State.events.length ? "No events match this filter." : "Hooks and the tmux monitor will appear here.";
+    panel.innerHTML = `<div class="empty"><h3>${State.events.length ? "Nothing here" : "No events yet"}</h3><p>${msg}</p></div>`;
     return;
   }
-  panel.innerHTML = State.events.map((e) => `
-    <div class="event-row">
-      <span class="ts">${relTime(e.createdAt)}</span>
-      <span class="type-tag ${e.type}">${escapeHtml(e.type)}</span>
-      <span class="msg"><span class="agent-tag">${escapeHtml(e.agent)}</span> ${escapeHtml(e.message)}</span>
-      <span class="ts">${new Date(e.createdAt + "Z").toLocaleString()}</span>
-    </div>
-  `).join("");
+  // Collapse runs of the identical message from the same agent into one row with
+  // a count — the log is otherwise a wall of repeated "waiting for your input".
+  const groups = [];
+  for (const e of filtered) {
+    const prev = groups[groups.length - 1];
+    if (prev && prev.agent === e.agent && prev.message === e.message && eventKind(prev) === eventKind(e)) {
+      prev.count++;
+      prev.firstAt = e.createdAt; // events are newest-first, so this walks back in time
+    } else {
+      groups.push({ ...e, count: 1, firstAt: e.createdAt });
+    }
+  }
+  let html = "";
+  let lastDay = null;
+  for (const e of groups) {
+    const day = eventDayLabel(e.createdAt);
+    if (day !== lastDay) { html += `<div class="event-day">${day}</div>`; lastDay = day; }
+    const kind = eventKind(e);
+    const abs = new Date(e.createdAt + "Z").toLocaleString();
+    html += `
+      <div class="event-row kind-${kind}">
+        <span class="event-ic ${kind}" title="${escapeHtml(e.type)}">${eventIcons[kind] || "•"}</span>
+        <span class="event-main">
+          <span class="agent-tag ${escapeHtml(e.agent)}">${escapeHtml(e.agent)}</span>
+          <span class="msg">${escapeHtml(e.message)}</span>
+          ${e.count > 1 ? `<span class="event-count">×${e.count}</span>` : ""}
+        </span>
+        <span class="ts" title="${escapeHtml(abs)}">${relTime(e.createdAt)}</span>
+      </div>`;
+  }
+  panel.innerHTML = html;
 }
 
 let eventSource = null;
@@ -1025,13 +1111,18 @@ function toolCardHTML(item) {
   const statusText = !item.done ? "running…" : item.isError ? "error" : "done";
   const output = (item.output || "").trim();
   const body = output ? `<pre class="tool-output">${escapeHtml(output.slice(-6000))}</pre>` : "";
+  // Long, finished outputs start collapsed to keep the stream scannable; the
+  // header is a toggle. Running cards stay open so you can watch them.
+  const longOutput = output.split("\n").length > 8 || output.length > 500;
+  const collapsed = item.done && !item.isError && longOutput;
   return `
-    <div class="tool-card ${status}" data-tool="${escapeHtml(item.id)}">
-      <div class="tool-head">
+    <div class="tool-card ${status} ${collapsed ? "collapsed" : ""}" data-tool="${escapeHtml(item.id)}">
+      <div class="tool-head" ${body ? 'role="button" tabindex="0"' : ""}>
         <span class="tool-icon">${icon}</span>
         <span class="tool-name">${escapeHtml(item.name)}</span>
         <span class="tool-label">${escapeHtml(label)}</span>
         <span class="tool-status ${status}">${statusText}</span>
+        ${body ? '<span class="tool-caret">▾</span>' : ""}
       </div>
       <div class="tool-body">${body}</div>
     </div>
@@ -1291,6 +1382,8 @@ route("settings", {
             <div class="kv"><span>Host</span><b>${escapeHtml(State.health?.hostname || "—")}</b></div>
             <div class="kv"><span>App</span><b>${escapeHtml(State.health?.app || "agent-ops")}</b></div>
             <div class="kv"><span>AI enabled</span><b>${State.aiStatus.enabled ? "yes" : "no — set ANTHROPIC_API_KEY"}</b></div>
+            ${State.aiStatus.enabled ? `<div class="kv"><span>AI provider</span><b>${escapeHtml((State.aiStatus.provider === "openai" ? "OpenAI" : "Anthropic"))}</b></div>
+            <div class="kv"><span>AI model</span><b>${escapeHtml(State.aiStatus.model || "—")}</b></div>` : ""}
             <div class="kv"><span>Agent input</span><b>${allowsInput ? "enabled" : "disabled — set ENABLE_AGENT_INPUT=true"}</b></div>
           </div>
         </div>
@@ -1482,6 +1575,17 @@ document.addEventListener("focusin", (e) => {
       el.scrollIntoView({ block: "center", behavior: "smooth" });
     } catch {/* */}
   }, 280);
+});
+
+// Collapse/expand an AI tool-call card by clicking (or Enter/Space on) its head.
+document.addEventListener("click", (e) => {
+  const head = e.target.closest?.(".tool-head[role='button']");
+  if (head) head.parentElement.classList.toggle("collapsed");
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const head = e.target.closest?.(".tool-head[role='button']");
+  if (head) { e.preventDefault(); head.parentElement.classList.toggle("collapsed"); }
 });
 
 refreshGlobal();

@@ -18,6 +18,7 @@ export type ManagedSession = {
   paneCommand: string;
   paneTitle: string;
   createdAt: string | null;
+  lastActivity: number | null;
   lastOutput: string;
   outputHash: string;
   git: GitStatus;
@@ -52,7 +53,7 @@ async function scanSessions(): Promise<ManagedSession[]> {
   const sessions = await tmux([
     "list-sessions",
     "-F",
-    "#{session_name}\t#{session_created_string}\t#{session_attached}"
+    "#{session_name}\t#{session_created_string}\t#{session_attached}\t#{session_activity}"
   ]);
   if (sessions.code !== 0) return [];
 
@@ -125,7 +126,12 @@ export async function tmux(args: string[]): Promise<{ code: number; stdout: stri
 }
 
 async function inspectManagedSession(row: string): Promise<ManagedSession> {
-  const [name, createdAt] = row.split("\t");
+  const [name, createdAt, , activity] = row.split("\t");
+  // tmux session_activity is epoch seconds of the last pane output. For an agent
+  // that is waiting on you, this is when it last printed — i.e. when it started
+  // waiting — so the UI can show "waiting 4m".
+  const activitySec = Number(activity);
+  const lastActivity = Number.isFinite(activitySec) && activitySec > 0 ? activitySec * 1000 : null;
   const pane = await tmux([
     "list-panes",
     "-t",
@@ -157,6 +163,7 @@ async function inspectManagedSession(row: string): Promise<ManagedSession> {
     paneCommand,
     paneTitle,
     createdAt: createdAt || null,
+    lastActivity,
     lastOutput,
     outputHash: simpleHash(lastOutput),
     git
