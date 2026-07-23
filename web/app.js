@@ -820,7 +820,7 @@ route("ai", {
     root.innerHTML = `
       <div class="page-head">
         <h1>AI assistant</h1>
-        <div class="sub">${State.aiStatus.enabled ? "Anthropic " + escapeHtml(State.aiStatus.model) : "ANTHROPIC_API_KEY not set"}</div>
+        <div class="sub">${State.aiStatus.enabled ? escapeHtml((State.aiStatus.provider === "openai" ? "OpenAI · " : "Anthropic · ") + State.aiStatus.model) : escapeHtml((State.aiStatus.provider === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY") + " not set")}</div>
         <div class="toolbar">
           <button class="btn" id="ai-new">+ new chat</button>
         </div>
@@ -927,11 +927,13 @@ function itemsFromTurns(turns) {
     }
     if (!Array.isArray(content)) continue;
     for (const block of content) {
+      // Neutral persisted shape (provider-independent).
       if (block.type === "text" && block.text) {
         items.push({ kind: "text", role: turn.role, text: block.text });
+      } else if (block.type === "tool") {
+        items.push({ kind: "tool", id: block.id, name: block.name, input: block.input, output: block.output || "", done: true, isError: Boolean(block.isError) });
+      // Legacy Anthropic-block shape from earlier saved conversations.
       } else if (block.type === "tool_use" || block.type === "server_tool_use") {
-        // A persisted server tool (web_search) always completed; client tools
-        // are marked done when their tool_result block is found below.
         const item = { kind: "tool", id: block.id, name: block.name, input: block.input, output: "", done: block.type === "server_tool_use", isError: false };
         toolsById[block.id] = item;
         items.push(item);

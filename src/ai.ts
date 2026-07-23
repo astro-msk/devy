@@ -1,4 +1,3 @@
-import Anthropic from "@anthropic-ai/sdk";
 import type { Response } from "express";
 import {
   deleteMemory,
@@ -8,28 +7,14 @@ import {
   saveConversation,
   saveMemory,
   memoryDigest,
-  type Conversation
+  type Conversation,
+  type ConversationTurn
 } from "./ai-memory.js";
 import { indexDigest } from "./repo-index.js";
-import { agentToolsEnabled, runTool, toolDefinitions } from "./agent-tools.js";
+import { agentToolsEnabled } from "./agent-tools.js";
+import { activeModel, aiConfigured, providerName, runAgent, type ChatMessage, type DisplayBlock } from "./agent-run.js";
 
-const DEFAULT_MODEL = process.env.AGENT_OPS_AI_MODEL || "claude-opus-4-8";
-const MAX_TOOL_ITERATIONS = 40;
-
-let client: Anthropic | null = null;
-function getClient(): Anthropic {
-  if (!client) {
-    if (!process.env.ANTHROPIC_API_KEY) {
-      throw new Error("ANTHROPIC_API_KEY is not set");
-    }
-    client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  }
-  return client;
-}
-
-export function aiConfigured(): boolean {
-  return Boolean(process.env.ANTHROPIC_API_KEY);
-}
+export { aiConfigured, activeModel, providerName } from "./agent-run.js";
 
 export async function buildSystemPrompt(): Promise<string> {
   const [memories, repos] = await Promise.all([memoryDigest(30), indexDigest(16000)]);
@@ -43,7 +28,7 @@ export async function buildSystemPrompt(): Promise<string> {
   ];
   if (toolsOn) {
     lines.push(
-      "You have real tools and act like Claude Code: run `bash`, `read_file`, and `write_file` to inspect and change anything on the box, and use `list_sessions` / `capture_session` / `send_session` to observe and unblock the OTHER Claude Code / Codex agents running in tmux. Prefer acting over guessing — when a question is answerable by running a command, run it. Chain tools until the task is actually done, then report the outcome first, concisely.",
+      "You are a coding/ops agent with real tools: run `bash`, `read_file`, and `write_file` to inspect and change anything on the box, and use `list_sessions` / `capture_session` / `send_session` to observe and unblock the OTHER Claude Code / Codex agents running in tmux. Prefer acting over guessing — when a question is answerable by running a command, run it. Chain tools until the task is actually done, then report the outcome first, concisely.",
       "Safety: you run as a non-root user behind Tailscale. Reversible actions: just do them. Irreversible or wide-blast-radius actions (deleting many files, killing production services, force-pushing, editing another agent's work): describe what you'll do and why before doing it. Never run destructive commands to 'clean up' unless asked.",
       "When you edit files, make the smallest correct change and say what you changed. Verify your work (build/test/inspect) when practical."
     );
@@ -107,7 +92,9 @@ export async function streamAsk({ conversationId, message, res }: AskOptions): P
 
   if (!aiConfigured()) {
     const reply =
-      "ANTHROPIC_API_KEY is not set on this server. Add it to /etc/agent-ops.env (or .env), restart `agent-ops`, and try again.\n\nThe rest of the app still works without an API key.";
+      providerName() === "openai"
+        ? "OPENAI_API_KEY is not set on this server. Add it to /etc/agent-ops.env, restart `agent-ops`, and try again.\n\nThe rest of the app works without an API key."
+        : "ANTHROPIC_API_KEY is not set on this server. Add it to /etc/agent-ops.env, restart `agent-ops`, and try again.\n\nThe rest of the app works without an API key.";
     send("delta", { text: reply });
     conversation.turns.push({ role: "assistant", content: reply, ts: new Date().toISOString() });
     await saveConversation(conversation);
@@ -117,106 +104,20 @@ export async function streamAsk({ conversationId, message, res }: AskOptions): P
   }
 
   const system = await buildSystemPrompt();
-  const toolsOn = agentToolsEnabled();
-  // The API needs full content blocks (tool_use/tool_result) preserved across
-  // turns, so run the loop on a working copy and persist the new turns after.
-  const work: Array<{ role: "user" | "assistant"; content: string | unknown[] }> = conversation.turns.map(
-    (t) => ({ role: t.role, content: t.content })
-  );
-  const baseLength = work.length;
-  let lastText = "";
+  // Provider messages are rebuilt fresh from a flattened text history; the live
+  // tool loop keeps full provider-native context in memory inside runAgent.
+  const history: ChatMessage[] = conversation.turns.map((turn) => ({ role: turn.role, text: turnText(turn.content) }));
 
-  const client = getClient();
-  const clientClosed = { value: false };
-  res.on("close", () => {
-    clientClosed.value = true;
-  });
-
+  let blocks: DisplayBlock[] = [];
   try {
-    for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
-      if (clientClosed.value) break;
-      let streamedText = "";
-      const stream = client.messages.stream({
-        model: DEFAULT_MODEL,
-        max_tokens: 16000,
-        // Adaptive thinking sharpens the tool-use decisions; the system prompt
-        // carries the repo + memory digest and is stable, so cache it.
-        thinking: toolsOn ? { type: "adaptive" } : undefined,
-        system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }],
-        // Client tools (bash/files/tmux) plus Anthropic's server-side web search
-        // so the assistant can look things up online mid-task.
-        tools: toolsOn
-          ? ([...toolDefinitions(), { type: "web_search_20260209", name: "web_search", max_uses: 5 }] as Anthropic.ToolUnion[])
-          : undefined,
-        messages: work as Anthropic.MessageParam[]
-      });
-
-      for await (const event of stream) {
-        if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
-          streamedText += event.delta.text;
-          send("delta", { text: event.delta.text });
-        } else if (event.type === "content_block_start") {
-          const block = event.content_block;
-          if (block.type === "tool_use") {
-            // Surface the tool call as soon as the model commits to it.
-            send("tool_start", { id: block.id, name: block.name });
-          } else if (block.type === "server_tool_use") {
-            send("tool_start", { id: block.id, name: block.name });
-          }
-        }
-      }
-
-      const finalMessage = await stream.finalMessage();
-      if (finalMessage.usage) {
-        send("usage", {
-          input: finalMessage.usage.input_tokens,
-          output: finalMessage.usage.output_tokens,
-          cacheRead: finalMessage.usage.cache_read_input_tokens ?? 0
-        });
-      }
-      if (streamedText.trim()) lastText = streamedText;
-
-      // Keep the full content (incl. thinking) in the live loop so the model
-      // sees its own reasoning; strip thinking only when persisting.
-      work.push({ role: "assistant", content: finalMessage.content });
-
-      if (finalMessage.stop_reason === "pause_turn") {
-        // Server tool (e.g. web search) hit its per-turn limit; resume.
-        continue;
-      }
-      if (finalMessage.stop_reason !== "tool_use") break;
-
-      const toolUses = finalMessage.content.filter(
-        (block): block is Anthropic.ToolUseBlock => block.type === "tool_use"
-      );
-      const toolResults: Anthropic.ToolResultBlockParam[] = [];
-      for (const call of toolUses) {
-        send("tool_use", { id: call.id, name: call.name, input: call.input });
-        const result = await runTool(call.name, call.input, {
-          onOutput: (chunk) => send("tool_output", { id: call.id, chunk })
-        });
-        send("tool_result", { id: call.id, isError: result.isError, content: result.content });
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: call.id,
-          content: result.content,
-          is_error: result.isError
-        });
-      }
-      work.push({ role: "user", content: toolResults });
-    }
+    blocks = await runAgent(system, history, send);
   } catch (error) {
     const msg = friendlyApiError((error as Error).message);
     send("error", { message: msg });
-    if (!lastText) lastText = msg;
+    if (!blocks.some((block) => block.type === "text")) blocks.push({ type: "text", text: msg });
   }
 
-  // Persist every new turn from this exchange, dropping thinking blocks (they
-  // are display-only and other models ignore them on resume).
-  const now = new Date().toISOString();
-  for (const turn of work.slice(baseLength)) {
-    conversation.turns.push({ role: turn.role, content: stripThinking(turn.content), ts: now });
-  }
+  conversation.turns.push({ role: "assistant", content: blocks, ts: new Date().toISOString() });
   if (conversation.title === "New chat" || conversation.title === deriveTitle(message)) {
     conversation.title = deriveTitle(message);
   }
@@ -225,14 +126,18 @@ export async function streamAsk({ conversationId, message, res }: AskOptions): P
   res.end();
 }
 
-// Thinking blocks must stay in the live loop (same-model replay) but are noise
-// in persisted history, so remove them before saving.
-function stripThinking(content: string | unknown[]): string | unknown[] {
-  if (!Array.isArray(content)) return content;
-  return content.filter((block) => {
-    const type = (block as { type?: string })?.type;
-    return type !== "thinking" && type !== "redacted_thinking";
-  });
+// Flatten a stored turn (plain string or DisplayBlock[]) into the text we replay
+// to the model as prior context. Tool actions become a compact note so the model
+// remembers what it already did without re-sending full tool payloads.
+function turnText(content: ConversationTurn["content"]): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const block of content as DisplayBlock[]) {
+    if (block?.type === "text") parts.push(block.text);
+    else if (block?.type === "tool") parts.push(`[ran ${block.name}${block.isError ? " (error)" : ""}]`);
+  }
+  return parts.join("\n").trim();
 }
 
 async function interceptSlashCommand(message: string): Promise<{ text: string; memory?: { id: string; topic: string } } | null> {
@@ -285,19 +190,25 @@ async function interceptSlashCommand(message: string): Promise<{ text: string; m
 // this deployment into one-line guidance the phone UI can show.
 function friendlyApiError(raw: string): string {
   const lower = raw.toLowerCase();
-  if (lower.includes("credit balance is too low")) {
-    return "Anthropic API credit balance is too low. Top up at console.anthropic.com (Billing), then retry — no code change needed.";
+  const provider = providerName() === "openai" ? "OpenAI" : "Anthropic";
+  const keyVar = providerName() === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY";
+  const billing = providerName() === "openai" ? "platform.openai.com (Billing)" : "console.anthropic.com (Billing)";
+  if (lower.includes("credit balance is too low") || lower.includes("insufficient_quota") || lower.includes("exceeded your current quota")) {
+    return `${provider} API has no available credit/quota. Top up at ${billing}, then retry — no code change needed.`;
   }
-  if (lower.includes("authentication") || lower.includes("invalid x-api-key") || lower.includes("401")) {
-    return "ANTHROPIC_API_KEY is invalid or expired. Update it in /etc/agent-ops.env and restart agent-ops.";
+  if (lower.includes("model_not_found") || lower.includes("does not exist") || lower.includes("no such model")) {
+    return `The configured model isn't available on this ${provider} account. Set OPENAI_MODEL (or AGENT_OPS_AI_MODEL) to a model you have access to and restart agent-ops.`;
   }
-  if (lower.includes("rate_limit") || lower.includes("429")) {
-    return "Anthropic API rate limit hit. Wait a moment and retry.";
+  if (lower.includes("authentication") || lower.includes("invalid api key") || lower.includes("incorrect api key") || lower.includes("invalid x-api-key") || lower.includes("401")) {
+    return `${keyVar} is invalid or expired. Update it in /etc/agent-ops.env and restart agent-ops.`;
+  }
+  if (lower.includes("rate_limit") || lower.includes("rate limit") || lower.includes("429")) {
+    return `${provider} API rate limit hit. Wait a moment and retry.`;
   }
   if (lower.includes("overloaded") || lower.includes("529")) {
-    return "Anthropic API is overloaded right now. Retry shortly.";
+    return `${provider} API is overloaded right now. Retry shortly.`;
   }
-  return `Anthropic API error: ${raw}`;
+  return `${provider} API error: ${raw}`;
 }
 
 function deriveTitle(message: string): string {

@@ -6,7 +6,7 @@ import { mkdir, readFile, statfs, writeFile } from "node:fs/promises";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { z } from "zod";
 import { requireTailnetRead, requireWriteAuth } from "./auth.js";
-import { aiConfigured, streamAsk } from "./ai.js";
+import { activeModel, aiConfigured, providerName, streamAsk } from "./ai.js";
 import {
   deleteConversation,
   deleteMemory,
@@ -325,7 +325,7 @@ export function createApp(): Express {
 
   // ─── AI assistant ─────────────────────────────────────────────────────────
   app.get("/api/ai/status", (_req, res) => {
-    res.json({ enabled: aiConfigured(), model: process.env.AGENT_OPS_AI_MODEL || "claude-opus-4-8" });
+    res.json({ enabled: aiConfigured(), provider: providerName(), model: activeModel() });
   });
 
   app.post("/api/ai/ask", requireWriteAuth, async (req, res) => {
