@@ -60,86 +60,80 @@ function getOpenAI(): OpenAI {
   return openaiClient;
 }
 
-function openaiTools(): OpenAI.Chat.Completions.ChatCompletionTool[] {
-  return toolDefinitions().map((tool) => ({
-    type: "function",
-    function: { name: tool.name, description: tool.description, parameters: tool.input_schema }
-  }));
+// Responses API tool shape: functions are flat (not nested under `.function`).
+// gpt-5.x reasoning models reject function tools on /v1/chat/completions, so we
+// use /v1/responses, which supports tools + reasoning together.
+function openaiTools(): OpenAI.Responses.Tool[] {
+  return toolDefinitions().map(
+    (tool) =>
+      ({
+        type: "function",
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.input_schema,
+        strict: false
+      }) as OpenAI.Responses.Tool
+  );
 }
 
 async function runOpenAI(system: string, history: ChatMessage[], emit: Emit): Promise<DisplayBlock[]> {
   const client = getOpenAI();
   const toolsOn = agentToolsEnabled();
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-    { role: "system", content: system },
-    ...history.map((m) => ({ role: m.role, content: m.text }) as OpenAI.Chat.Completions.ChatCompletionMessageParam)
-  ];
+  const input: OpenAI.Responses.ResponseInputItem[] = history.map(
+    (m) => ({ role: m.role, content: m.text }) as OpenAI.Responses.ResponseInputItem
+  );
   const blocks: DisplayBlock[] = [];
 
   for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
-    const stream = await client.chat.completions.create({
+    const stream = await client.responses.create({
       model: openaiModel(),
-      messages,
+      instructions: system,
+      input,
       tools: toolsOn ? openaiTools() : undefined,
-      stream: true,
-      stream_options: { include_usage: true }
+      stream: true
     });
 
     let text = "";
-    let finish: string | null = null;
-    const calls = new Map<number, { id: string; name: string; args: string; started: boolean }>();
+    let final: OpenAI.Responses.Response | null = null;
 
-    for await (const chunk of stream) {
-      const choice = chunk.choices?.[0];
-      const delta = choice?.delta;
-      if (delta?.content) {
-        text += delta.content;
-        emit("delta", { text: delta.content });
+    for await (const event of stream) {
+      if (event.type === "response.output_text.delta") {
+        text += event.delta;
+        emit("delta", { text: event.delta });
+      } else if (event.type === "response.output_item.added" && event.item.type === "function_call") {
+        emit("tool_start", { id: event.item.call_id, name: event.item.name });
+      } else if (event.type === "response.completed") {
+        final = event.response;
       }
-      for (const tc of delta?.tool_calls || []) {
-        const slot = calls.get(tc.index) || { id: "", name: "", args: "", started: false };
-        if (tc.id) slot.id = tc.id;
-        if (tc.function?.name) slot.name += tc.function.name;
-        if (tc.function?.arguments) slot.args += tc.function.arguments;
-        if (!slot.started && slot.name && slot.id) {
-          slot.started = true;
-          emit("tool_start", { id: slot.id, name: slot.name });
-        }
-        calls.set(tc.index, slot);
-      }
-      if (choice?.finish_reason) finish = choice.finish_reason;
-      if (chunk.usage) emit("usage", { output: chunk.usage.completion_tokens });
     }
 
     if (text.trim()) blocks.push({ type: "text", text });
+    if (final?.usage) emit("usage", { output: final.usage.output_tokens });
 
-    const toolCalls = [...calls.values()].filter((call) => call.name && call.id);
-    if (!toolCalls.length || finish === "stop") break;
+    const fnCalls = (final?.output || []).filter(
+      (item): item is OpenAI.Responses.ResponseFunctionToolCall => item.type === "function_call"
+    );
+    if (!fnCalls.length) break;
 
-    messages.push({
-      role: "assistant",
-      content: text || null,
-      tool_calls: toolCalls.map((call) => ({
-        id: call.id,
-        type: "function",
-        function: { name: call.name, arguments: call.args || "{}" }
-      }))
-    });
+    // Feed the model's own output (message + reasoning + function_call items)
+    // back in, then append each tool result, and loop. Cast bridges the
+    // output-item vs input-item union mismatch in the SDK types.
+    if (final?.output) input.push(...(final.output as unknown as OpenAI.Responses.ResponseInputItem[]));
 
-    for (const call of toolCalls) {
-      let input: unknown = {};
+    for (const call of fnCalls) {
+      let toolInput: unknown = {};
       try {
-        input = call.args ? JSON.parse(call.args) : {};
+        toolInput = call.arguments ? JSON.parse(call.arguments) : {};
       } catch {
-        input = {};
+        toolInput = {};
       }
-      emit("tool_use", { id: call.id, name: call.name, input });
-      const result = await runTool(call.name, input, {
-        onOutput: (chunk) => emit("tool_output", { id: call.id, chunk })
+      emit("tool_use", { id: call.call_id, name: call.name, input: toolInput });
+      const result = await runTool(call.name, toolInput, {
+        onOutput: (chunk) => emit("tool_output", { id: call.call_id, chunk })
       });
-      emit("tool_result", { id: call.id, isError: result.isError, content: result.content });
-      blocks.push({ type: "tool", id: call.id, name: call.name, input, output: result.content, isError: result.isError });
-      messages.push({ role: "tool", tool_call_id: call.id, content: result.content });
+      emit("tool_result", { id: call.call_id, isError: result.isError, content: result.content });
+      blocks.push({ type: "tool", id: call.call_id, name: call.name, input: toolInput, output: result.content, isError: result.isError });
+      input.push({ type: "function_call_output", call_id: call.call_id, output: result.content });
     }
   }
 
