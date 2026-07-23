@@ -58,7 +58,9 @@ const bash: ToolDef = {
   async run(input, ctx) {
     const command = String(input.command || "").trim();
     if (!command) return { content: "empty command", isError: true };
-    if (BLOCKED_BASH.some((pattern) => pattern.test(command))) {
+    // Full yolo: AGENT_UNRESTRICTED_BASH=true drops even the brick-guard.
+    const guarded = process.env.AGENT_UNRESTRICTED_BASH !== "true";
+    if (guarded && BLOCKED_BASH.some((pattern) => pattern.test(command))) {
       return {
         content: `Refused: "${command}" matches a destructive-command guard. Rephrase to be more specific if you really mean it.`,
         isError: true

@@ -486,6 +486,10 @@ route("terminal", {
             </div>
           </div>
           <div class="terminal-host" id="term-host"></div>
+          <form class="term-input-row" id="term-input-row">
+            <input id="term-input" placeholder="Type to this session…" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="send" />
+            <button type="submit" class="btn btn-primary" title="Send Enter">↵</button>
+          </form>
         </div>
       </div>
     `;
@@ -495,10 +499,48 @@ route("terminal", {
       const s = State.selectedSession;
       if (s) window.open(`#terminal/${encodeURIComponent(s)}`, "_blank", "width=1000,height=700");
     });
-    $$(".quick-key").forEach((b) => b.addEventListener("click", () => sendKey(b.dataset.key)));
+    $$(".quick-key").forEach((b) => b.addEventListener("click", () => { sendKey(b.dataset.key); $("#term-input")?.focus(); }));
+    // Tap the screen to focus xterm on desktop/tablet; the input row drives phones.
+    $("#term-host").addEventListener("click", () => { try { terminalState?.term?.focus(); } catch {/* */} });
+    wireTerminalInput();
     bootTerminal();
   },
 });
+
+// A plain text input that types straight into the tmux session over the
+// WebSocket. xterm's own hidden textarea is unreliable on phones (keyboard
+// won't open, IME conflicts), so this is the dependable path to type on mobile —
+// and a handy composer on desktop too.
+function wireTerminalInput() {
+  const input = $("#term-input");
+  const row = $("#term-input-row");
+  if (!input || !row) return;
+  let last = "";
+  const sendData = (data) => {
+    const ws = terminalState?.ws;
+    if (!ws || ws.readyState !== ws.OPEN) return false;
+    if (!terminalState.canWrite) { toast("Read-only. Save AGENT_OPS_TOKEN in Settings to type.", "error"); return false; }
+    ws.send(JSON.stringify({ type: "data", data }));
+    return true;
+  };
+  // Send characters as they're typed so TUIs (Claude Code, prompts) update live.
+  input.addEventListener("input", () => {
+    const v = input.value;
+    if (v.startsWith(last)) sendData(v.slice(last.length));
+    else if (last.startsWith(v)) { for (let i = 0; i < last.length - v.length; i++) sendData("\x7f"); }
+    else { for (let i = 0; i < last.length; i++) sendData("\x7f"); sendData(v); }
+    last = v;
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); sendData("\r"); input.value = ""; last = ""; }
+  });
+  row.addEventListener("submit", (e) => {
+    e.preventDefault();
+    sendData("\r");
+    input.value = ""; last = "";
+    input.focus();
+  });
+}
 
 function refreshTerminalList() {
   const list = $("#term-session-list");
@@ -531,7 +573,7 @@ function bootTerminal() {
   if (!host) return;
   const session = State.selectedSession;
   if (!session) {
-    host.innerHTML = `<div class="empty"><h3>Pick a session</h3><p>Choose one on the left.</p></div>`;
+    host.innerHTML = `<div class="empty"><h3>Pick a session</h3><p>Choose one from the list.</p></div>`;
     return;
   }
   $("#term-title").textContent = session;
@@ -597,6 +639,11 @@ function bootTerminal() {
     if (payload.type === "ready") {
       terminalState.canWrite = payload.canWrite;
       setStatus(payload.canWrite ? "live" : "read-only", payload.canWrite ? "on" : "warn");
+      const input = $("#term-input");
+      if (input) {
+        input.disabled = !payload.canWrite;
+        input.placeholder = payload.canWrite ? "Type to this session…" : "Read-only — save token in Settings";
+      }
       return;
     }
     if (payload.type === "snapshot") {
@@ -817,6 +864,9 @@ function startEventStream() {
 route("ai", {
   title: "AI",
   async render(root) {
+    // Ensure provider/model is known before drawing the header (avoids a flash
+    // of "…KEY not set" when the page opens before global status has loaded).
+    try { State.aiStatus = await api("/api/ai/status"); } catch {/* keep cached */}
     root.innerHTML = `
       <div class="page-head">
         <h1>AI assistant</h1>

@@ -37,6 +37,13 @@ export async function buildSystemPrompt(): Promise<string> {
       "Tools are currently disabled (ENABLE_AGENT_TOOLS=false), so answer from context only. Be concise, technically precise, and opinionated. Cite specific paths (file.py:line) when relevant."
     );
   }
+  if (toolsOn) {
+    lines.push(
+      "You ARE the agent-ops dashboard, and you can modify and redeploy YOURSELF. Your source is at /home/ubuntu/apps/agent-ops — TypeScript in src/ (backend, the AI agent = src/ai.ts + src/agent-run.ts + src/agent-tools.ts), static PWA in web/. You have full sudo (NOPASSWD ALL) on this host.",
+      "To ship a backend change: edit files under src/, run `npm run build` in that directory, then redeploy. Restarting the service kills the process streaming this very reply, so ALWAYS restart DETACHED so your message finishes first: `nohup bash -c 'sleep 2; sudo systemctl restart agent-ops agent-sessions' >/dev/null 2>&1 &`. Tell the user the restart is queued and the change lands in ~2s.",
+      "Frontend-only edits (web/) take effect on reload with no rebuild — bump CACHE_NAME in web/sw.js so clients pull the new files. Always `npm run build` (or at least `npx tsc --noEmit`) before restarting so a type error can't take the app down."
+    );
+  }
   lines.push(
     "When the user shares a preference or insight worth remembering, suggest saving it as a memory (/remember).",
     "Match the user's terseness — a short answer for short questions.",
