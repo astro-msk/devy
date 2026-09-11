@@ -1,4 +1,4 @@
-// agent-ops PWA — unified app shell with router and pages.
+// Devy PWA — unified app shell with router and pages.
 
 // ─── State ────────────────────────────────────────────────────────────────
 const State = {
@@ -1380,7 +1380,7 @@ route("settings", {
           <div class="panel-header"><h2>Server</h2></div>
           <div class="panel-pad">
             <div class="kv"><span>Host</span><b>${escapeHtml(State.health?.hostname || "—")}</b></div>
-            <div class="kv"><span>App</span><b>${escapeHtml(State.health?.app || "agent-ops")}</b></div>
+            <div class="kv"><span>App</span><b>${escapeHtml(State.health?.app || "devy")}</b></div>
             <div class="kv"><span>AI enabled</span><b>${State.aiStatus.enabled ? "yes" : "no — set ANTHROPIC_API_KEY"}</b></div>
             ${State.aiStatus.enabled ? `<div class="kv"><span>AI provider</span><b>${escapeHtml((State.aiStatus.provider === "openai" ? "OpenAI" : "Anthropic"))}</b></div>
             <div class="kv"><span>AI model</span><b>${escapeHtml(State.aiStatus.model || "—")}</b></div>` : ""}
@@ -1518,6 +1518,7 @@ function spinnerHTML() { return `<div class="empty"><div class="spinner"></div><
 
 $("#refresh").addEventListener("click", () => { refreshGlobal(); if (currentRoute().name === "projects") loadProjects(); if (currentRoute().name === "events") loadEvents(); });
 $("#nav-toggle")?.addEventListener("click", () => document.body.classList.toggle("nav-open"));
+$("#nav-scrim")?.addEventListener("click", () => document.body.classList.remove("nav-open"));
 
 // Some standalone PWA contexts (iOS, some Android browsers) swallow
 // `<a href="#…">` navigation; force the hash update from JS so nav always works.

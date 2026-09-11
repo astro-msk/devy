@@ -14,5 +14,5 @@ attachTerminalBridge(server);
 startMonitor();
 startSlackInputListener(sendSessionInput);
 server.listen(port, host, () => {
-  console.log(`agent-ops listening on http://${host}:${port}`);
+  console.log(`Devy listening on http://${host}:${port}`);
 });

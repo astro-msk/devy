@@ -855,3 +855,218 @@ label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color:
   input, select, textarea { font-size: 16px; }
   .session-card .quick-input input { font-size: 16px; }
 }
+
+/* Mobile layout pass: compact, touch-friendly, and genuinely viewport-bound. */
+.nav-scrim { display: none; }
+
+@media (max-width: 720px) {
+  :root { --topbar-h: 48px; --tabs-h: 60px; }
+
+  .topbar {
+    padding-left: calc(10px + var(--safe-left));
+    padding-right: calc(10px + var(--safe-right));
+    gap: 8px;
+  }
+  .topbar .kbd-hint, .crumb-sep, .crumb-context { display: none; }
+  .crumbs { font-size: 15px; }
+  .icon-btn { width: 36px; height: 36px; }
+
+  /* The hamburger opens the full nav as a proper off-canvas drawer. */
+  .sidebar {
+    display: flex;
+    position: fixed;
+    z-index: 52;
+    inset: 0 auto 0 0;
+    width: min(82vw, 300px);
+    padding-top: calc(18px + var(--safe-top));
+    padding-bottom: calc(14px + var(--safe-bot));
+    transform: translateX(-105%);
+    transition: transform 180ms ease;
+    box-shadow: var(--shadow);
+  }
+  body.nav-open .sidebar { transform: translateX(0); }
+  .nav-scrim {
+    display: block;
+    position: fixed;
+    z-index: 51;
+    inset: 0;
+    border: 0;
+    padding: 0;
+    background: rgba(0, 0, 0, 0.58);
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 180ms ease, visibility 180ms ease;
+  }
+  body.nav-open .nav-scrim { opacity: 1; visibility: visible; }
+  body.nav-open { touch-action: none; }
+  .sidebar .nav-item {
+    grid-template-columns: 24px 1fr auto;
+    justify-items: stretch;
+    min-height: 44px;
+    font-size: 15px;
+  }
+  .sidebar .nav-item span:not(.nav-icon):not(.nav-badge),
+  .sidebar .brand div:not(.brand-mark),
+  .sidebar .health-row span:last-child { display: initial; }
+  .sidebar .nav-item .nav-badge { position: static; }
+  .sidebar .stat-grid { display: grid; }
+
+  .page {
+    padding: 10px calc(10px + var(--safe-right))
+      calc(var(--tabs-h) + var(--safe-bot) + 12px)
+      calc(10px + var(--safe-left));
+    scrollbar-width: none;
+  }
+  .page::-webkit-scrollbar { display: none; }
+  .bottom-tabs { min-height: var(--tabs-h); padding-top: 4px; }
+  .bottom-tabs a { justify-content: center; min-width: 0; padding: 4px 2px; }
+  .bottom-tabs a span:first-child { font-size: 17px; }
+
+  .page-head { gap: 6px 10px; margin-bottom: 10px; }
+  .page-head h1 { width: 100%; font-size: 20px; }
+  .page-head .sub { flex: 1 1 190px; line-height: 1.35; }
+  .page-head .toolbar { margin-left: 0; }
+  .panel { border-radius: var(--radius); }
+  .panel-header { padding: 11px 12px; }
+  .panel-pad { padding: 13px 14px; }
+  .empty { padding: 36px 14px; }
+
+  /* Session overview: readable stats and cards without desktop-scale whitespace. */
+  .sessions-hero { gap: 10px; padding: 2px 0 12px; margin-bottom: 10px; }
+  .sessions-hero .hero-left h1 { font-size: 21px; }
+  .sessions-hero .hero-sub { font-size: 12px; }
+  .sessions-hero .stat-row { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+  .stat-card { min-width: 0; padding: 6px 8px; flex-direction: row; gap: 7px; }
+  .stat-card .stat-num { font-size: 17px; }
+  .stat-card .stat-lab { margin: 0; font-size: 9.5px; }
+  .sessions-hero .hero-actions { gap: 8px; }
+  .sessions-hero .chip-row, #event-filters {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 2px;
+    scrollbar-width: none;
+  }
+  .sessions-hero .chip-row::-webkit-scrollbar, #event-filters::-webkit-scrollbar { display: none; }
+  .chip { flex: 0 0 auto; min-height: 34px; }
+  .session-card { min-height: 0; padding: 13px 13px 12px 15px; gap: 9px; }
+  .card-top { align-items: flex-start; gap: 8px; }
+  .card-title { flex-wrap: wrap; gap: 6px; }
+  .card-title h3 { max-width: 170px; font-size: 15px; }
+  .card-sub { gap: 4px; }
+  .session-card pre.preview { min-height: 72px; max-height: 124px; padding: 10px 11px; }
+  .session-card .actions .btn { min-height: 36px; }
+
+  /* Stack dense desktop rows and let long repo/server values wrap. */
+  .project-row { grid-template-columns: minmax(0, 1fr); padding: 13px; gap: 10px; }
+  .project-row .name { flex-wrap: wrap; }
+  .project-row .path { overflow-wrap: anywhere; margin-top: 5px; }
+  .project-row .actions { justify-content: stretch; }
+  .project-row .actions .btn { flex: 1; min-height: 38px; }
+  .settings-grid { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .kv { grid-template-columns: minmax(90px, 1fr) minmax(0, auto); }
+  .kv b { max-width: 58vw; text-align: right; overflow-wrap: anywhere; }
+
+  .event-row {
+    grid-template-columns: 22px minmax(0, 1fr);
+    align-items: start;
+    gap: 7px 9px;
+    padding: 11px 12px;
+  }
+  .event-row .ts { grid-column: 2; grid-row: 2; }
+  .event-main { align-items: flex-start; gap: 6px; }
+  .event-row .msg { flex-basis: 100%; line-height: 1.4; }
+
+  /* Chat and terminal use the remaining viewport instead of fixed pixel math. */
+  body[data-route="ai"] .page,
+  body[data-route="terminal"] .page { padding-top: 8px; }
+  .ai-page, .terminal-page { height: auto; min-height: 0; }
+  .ai-stream { padding: 11px; }
+  .ai-turn .body { padding: 10px 11px; }
+  .ai-composer { gap: 6px; padding: 8px; }
+  .ai-composer textarea { min-height: 48px; max-height: 120px; }
+  .ai-composer .btn { padding-inline: 12px; }
+  .ai-conv-side #ai-conv-list { padding: 4px; }
+  .ai-conv-row { padding: 6px 10px; }
+
+  .session-list-panel .panel-header { display: none; }
+  .session-list-panel #term-session-list { padding: 4px; }
+  .session-pick { min-width: 118px; padding: 6px 8px; }
+  .terminal-bar { padding: 6px 8px; flex-wrap: wrap; gap: 5px; }
+  .terminal-bar .left { min-width: 0; width: 100%; }
+  .terminal-bar .left strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .terminal-bar .right { width: 100%; margin-left: 0; }
+  .term-input-row { padding: 6px; padding-bottom: calc(6px + var(--safe-bot)); }
+  .term-input-row input { padding: 9px 10px; }
+
+  .toasts { left: 10px; right: 10px; bottom: calc(var(--tabs-h) + var(--safe-bot) + 8px); max-width: none; }
+  body.kbd-open .toasts { bottom: 8px; }
+  .palette { padding: calc(10px + var(--safe-top)) 10px 10px; }
+  .palette-card { width: 100%; max-height: calc(var(--vvh) - var(--safe-top) - 20px); }
+}
+
+@media (max-width: 360px) {
+  .bottom-tabs a { font-size: 9px; }
+  .card-title h3 { max-width: 135px; }
+  .sessions-hero .stat-row { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 720px) {
+  .sessions-hero > *, .sessions-hero .hero-actions,
+  .ai-conv-side, .session-list-panel { min-width: 0; }
+}
+
+/* Assistant is a workspace, not a stack of desktop cards. On phones keep the
+   controls compact and let the conversation use the full available width. */
+.ai-conv { overflow: hidden; }
+
+@media (max-width: 720px) {
+  body[data-route="ai"] .page {
+    padding-left: 0;
+    padding-right: 0;
+    padding-top: 6px;
+  }
+  body[data-route="ai"] .page-head {
+    flex: 0 0 38px;
+    flex-wrap: nowrap;
+    margin: 0;
+    padding: 0 10px 6px;
+  }
+  body[data-route="ai"] .page-head h1 { display: none; }
+  body[data-route="ai"] .page-head .sub {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+  }
+  body[data-route="ai"] .page-head .toolbar {
+    flex: 0 0 auto;
+    margin-left: auto;
+  }
+  body[data-route="ai"] #ai-new {
+    min-height: 32px;
+    padding: 5px 10px;
+  }
+  body[data-route="ai"] .ai-page { gap: 0; }
+  body[data-route="ai"] .ai-conv-side {
+    border-left: 0;
+    border-right: 0;
+    border-radius: 0;
+    box-shadow: none;
+  }
+  body[data-route="ai"] .ai-conv-side #ai-conv-list { padding: 4px 10px; }
+  body[data-route="ai"] .ai-conv {
+    border-left: 0;
+    border-right: 0;
+    border-bottom: 0;
+    border-radius: 0;
+  }
+  body[data-route="ai"] .ai-stream { padding: 10px; }
+  body[data-route="ai"] .ai-turn { margin-bottom: 10px; }
+  body[data-route="ai"] .ai-turn .body { line-height: 1.45; }
+  body[data-route="ai"] .ai-composer textarea {
+    min-height: 44px;
+    height: 44px;
+  }
+  body[data-route="ai"] .ai-composer .btn { align-self: auto; }
+  body[data-route="ai"] .empty { padding: 28px 14px; }
+}

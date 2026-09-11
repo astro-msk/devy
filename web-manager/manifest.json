@@ -1,6 +1,6 @@
 {
-  "name": "Mukil's Dev Agent Sessions",
-  "short_name": "Agent Sessions",
+  "name": "Devy Agent Sessions",
+  "short_name": "Devy",
   "description": "Manage Claude and Codex tmux sessions by branch",
   "start_url": "/",
   "display": "standalone",

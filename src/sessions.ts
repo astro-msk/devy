@@ -84,7 +84,7 @@ export async function createManagedSession(name: string, agent: "claude" | "code
   // `new-session -d -s NAME -c DIR agent` dies instantly if the agent binary is
   // missing or exits, so the session vanishes and the UI shows nothing. Wrap it
   // so the error stays on screen and the session drops to a shell instead.
-  const command = `${agent} || echo "[agent-ops] ${agent} exited with status $?"; exec bash -l`;
+  const command = `${agent} || echo "[Devy] ${agent} exited with status $?"; exec bash -l`;
   const result = await tmux(["new-session", "-d", "-s", name, "-c", resolved, "bash", "-lc", command]);
   if (result.code !== 0) {
     throw new Error(result.stderr || `failed to create ${agent} session`);

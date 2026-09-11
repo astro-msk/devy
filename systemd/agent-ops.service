@@ -1,5 +1,5 @@
 [Unit]
-Description=agent-ops dashboard
+Description=Devy operations agent
 After=network-online.target tailscaled.service
 Wants=network-online.target
 

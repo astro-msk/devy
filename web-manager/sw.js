@@ -1,4 +1,4 @@
-const CACHE_NAME = "agent-sessions-v9";
+const CACHE_NAME = "devy-sessions-v10";
 const ASSETS = ["/", "/index.html", "/styles.css", "/app.js", "/manifest.json", "/icon.svg"];
 
 self.addEventListener("install", (event) => {

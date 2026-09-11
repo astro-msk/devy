@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-cd /home/ubuntu/apps/agent-ops || exit 1
+cd /home/ubuntu/apps/devy || exit 1
 
 while true; do
   echo "===== $(date -Is) agent-sessions smoke ====="

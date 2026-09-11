@@ -1,6 +1,6 @@
-# agent-ops
+# Devy
 
-Tailscale-only PWA dashboard for watching all Claude Code and Codex tmux sessions and sending Slack alerts when an agent appears to need input.
+Tailscale-only operations agent for watching Claude Code and Codex tmux sessions, triaging Slack references, and delivering approved code changes as pull requests.
 
 This MVP intentionally has no browser login. Tailscale is the access layer. Do not expose port `8787` to the public internet.
 
@@ -13,6 +13,8 @@ This MVP intentionally has no browser login. Tailscale is the access layer. Do n
 - Polls discovered Claude/Codex tmux sessions every 7 seconds and creates an `approval_required` event if a waiting prompt lasts more than 10 seconds.
 - Deduplicates monitor alerts per tmux session so parallel repos get separate alert state.
 - Sends Slack webhook alerts for `approval_required`, `notification`, and `error`, including the source tmux session.
+- Watches explicit references to Mukil in every Slack conversation the app can access, adds bounded local context, and reports urgency, relevance, recommended action, and code feasibility.
+- Runs feasibility checks with Codex in a read-only sandbox; approved builds run in isolated git worktrees and stop at a review-ready pull request.
 - Optionally sends text input to any observed tmux session when `ENABLE_AGENT_INPUT=true`.
 - Exposes read APIs without login over Tailscale.
 - Requires `AGENT_OPS_TOKEN` for non-local writes to `POST /api/events`.
@@ -20,7 +22,7 @@ This MVP intentionally has no browser login. Tailscale is the access layer. Do n
 ## Setup
 
 ```bash
-cd /home/ubuntu/apps/agent-ops
+cd /home/ubuntu/apps/devy
 npm install
 cp .env.example .env
 nano .env
@@ -62,9 +64,18 @@ AGENT_OPS_TOKEN=replace-with-a-random-token-for-write-hooks
 SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
 SLACK_BOT_TOKEN=
 SLACK_APP_TOKEN=
+SLACK_USER_TOKEN=
 SLACK_CHANNEL_ID=
-SLACK_SOCKET_MODE=false
+SLACK_SOCKET_MODE=true
+SLACK_WATCH_USER_ID=U0123456789
+SLACK_WATCH_NAMES=
+SLACK_OBSERVE_CHANNELS=
+SLACK_TRIAGE_CHANNEL_ID=C0123456789
+SLACK_CONTEXT_MESSAGES=12
+DEVY_REPOSITORIES=Pilot=/home/ubuntu/work/repos/Pilot,Crucible=/home/ubuntu/work/repos/Crucible
 ENABLE_AGENT_INPUT=false
+ENABLE_AGENT_ALERTS=false
+SLACK_LOG_LEVEL=info
 AGENT_WAIT_ALERT_SECONDS=30
 ```
 
@@ -77,6 +88,10 @@ Use `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_CHANNEL_ID`, and `SLACK_SOCKET_
 `CLAUDE_TMUX_SESSION` and `CODEX_TMUX_SESSION` are still used by the legacy `/api/agents/:agent/input` endpoint. Discovery and Slack monitoring use `tmux list-sessions`, so session names like `claude-pilot` and `codex-app-a` are picked up automatically.
 
 `AGENT_WAIT_ALERT_SECONDS=30` means a Claude or Codex tmux session must look like it needs input for at least 30 seconds before the tmux fallback monitor sends an alert.
+
+`ENABLE_AGENT_ALERTS=false` stops every legacy tmux/hook alert (`approval_required`, `notification`, `error`) from being posted to `SLACK_CHANNEL_ID`. Events are still recorded in SQLite and shown on the dashboard, and Devy reference triage reports are unaffected — they are a separate path. Use this when the alert channel is too noisy.
+
+`SLACK_LOG_LEVEL` sets the Bolt log level: `info` (default), `debug`, `warn`, `error`. `debug` writes full Slack payloads, including message text, to the journal; enable it only while diagnosing event delivery, then set it back.
 
 ## API
 
@@ -119,7 +134,7 @@ From a browser over Tailscale, this endpoint requires `AGENT_OPS_TOKEN` and `ENA
 Make the hook executable:
 
 ```bash
-chmod +x /home/ubuntu/apps/agent-ops/scripts/hook-claude-notify.sh
+chmod +x /home/ubuntu/apps/devy/scripts/hook-claude-notify.sh
 ```
 
 Example `~/.claude/settings.json` notification hook:
@@ -133,7 +148,7 @@ Example `~/.claude/settings.json` notification hook:
         "hooks": [
           {
             "type": "command",
-            "command": "/home/ubuntu/apps/agent-ops/scripts/hook-claude-notify.sh"
+            "command": "/home/ubuntu/apps/devy/scripts/hook-claude-notify.sh"
           }
         ]
       }
@@ -149,13 +164,13 @@ The script reads stdin JSON, posts a `notification` event for `claude`, includes
 Make the hook executable:
 
 ```bash
-chmod +x /home/ubuntu/apps/agent-ops/scripts/hook-codex-notify.sh
+chmod +x /home/ubuntu/apps/devy/scripts/hook-codex-notify.sh
 ```
 
 Codex hooks are registered and reviewed from Codex with `/hooks`. Add a command hook that runs:
 
 ```text
-/home/ubuntu/apps/agent-ops/scripts/hook-codex-notify.sh
+/home/ubuntu/apps/devy/scripts/hook-codex-notify.sh
 ```
 
 The script reads stdin, posts a `notification` event for `codex`, attaches the current tmux session when available, and marks it `completed` when the payload text looks like a completion/stop event. It exits `0` even if the local API is down.
@@ -173,7 +188,7 @@ curl -X POST http://127.0.0.1:8787/api/events \
 Expected Slack alert:
 
 ```text
-[Mukil's Dev Agent] Claude needs input
+[Devy] Claude needs input
 
 Agent: Claude
 State: Needs input
@@ -209,10 +224,10 @@ sudo systemctl restart agent-ops
 
 Flow:
 
-1. `agent-ops` posts each alert as its own top-level Slack message.
+1. Devy posts each alert as its own top-level Slack message.
 2. The app stores that message's Slack thread ID in SQLite.
 3. You reply in that thread.
-4. `agent-ops` receives the reply over Socket Mode.
+4. Devy receives the reply over Socket Mode.
 5. The reply text is sent to the exact tmux session from that alert with Enter.
 
 Safe options:
@@ -220,6 +235,88 @@ Safe options:
 - Use the browser dashboard over Tailscale for input.
 - Use Slack Socket Mode for reply-to-thread input.
 - Use a deliberately public, signature-verified Slack relay only if you decide to relax the Tailscale-only rule.
+
+## Slack Reference Triage and Approved Builds
+
+Set `SLACK_WATCH_USER_ID` to Mukil's Slack member ID and `SLACK_TRIAGE_CHANNEL_ID` to the private channel where Devy should post reports. `SLACK_CHANNEL_ID` is used when the dedicated triage channel is unset.
+
+What Devy acts on, in order of narrowness:
+
+- a DM to Devy from `SLACK_WATCH_USER_ID`;
+- an explicit `<@SLACK_WATCH_USER_ID>` reference written by someone else;
+- a bare textual name, **only** if you opt in by listing it in `SLACK_WATCH_NAMES` (comma-separated, whole-word, case-insensitive). Empty by default because it is a much wider net.
+
+`SLACK_OBSERVE_CHANNELS` further confines Devy to a comma-separated allowlist of channel IDs. Empty means every channel your Slack event subscriptions deliver. DMs to Devy are always honoured.
+
+Everything else is dropped in the handler: it is never stored, never sent to Codex, and never logged. Only a message that triggers a triage is persisted (its text, up to `SLACK_CONTEXT_MESSAGES` surrounding messages, and the analysis) in `data/agent-ops.sqlite`.
+
+### Talking to Devy
+
+DM Devy, or `@Devy` in a channel and keep replying in that thread, and it answers conversationally like an agent: read-only Codex against the configured repositories, with the last `SLACK_CHAT_HISTORY_TURNS` turns of that conversation as context. In a DM the whole conversation is one context; in a channel each thread is its own context. Replies cite the files it actually read.
+
+Chat is the default for anything you send it. A message that explicitly asks for work — `can you add …`, `please implement …` — routes to the approval-gated triage path instead and comes back with *Approve build* / *Reject* buttons, so conversation can never silently turn into a code change. Turns are stored in `slack_chat_turns` in `data/agent-ops.sqlite`.
+
+```bash
+SLACK_CHAT_HISTORY_TURNS=20
+SLACK_CHAT_TIMEOUT_SECONDS=300
+```
+
+### Acknowledgements
+
+Every report Devy posts must be acknowledged. While one is unacknowledged, Devy re-pings it in its thread every `SLACK_ACK_REMINDER_MINUTES` (default 30), mentioning you and broadcasting the reminder to the channel so it is not buried in an unopened thread. The reminder is numbered, so `Reminder 4` means it has waited two hours.
+
+A report counts as acknowledged when you press *Acknowledge*, reply `ack` (also `ok`, `got it`, `noted`, `thanks`), approve or reject a build, or reply anything at all in that thread — replying means you saw it. Acknowledging is idempotent, and a dismissed triage is never pinged.
+
+```bash
+SLACK_ACK_REMINDER_MINUTES=30
+```
+
+Use two Slack identities:
+
+- The Devy bot token posts reports, receives direct `@Devy` commands, and handles approval buttons. The bot does not need to join every monitored channel.
+- A user token authorized by Mukil receives workspace/user message events and reads context with Mukil's visibility. Treat this `xoxp-...` token as a secret.
+
+Under **OAuth & Permissions → Bot Token Scopes**, add:
+
+- `app_mentions:read`
+- `chat:write`
+- `im:history` for direct messages to Devy
+
+Under **OAuth & Permissions → User Token Scopes**, add:
+
+- `channels:history`
+- `groups:history`
+- `im:history`
+- `mpim:history`
+
+Under **Event Subscriptions → Subscribe to bot events**, add `app_mention` and `message.im`. Under **Subscribe to events on behalf of users** (called **Workspace Events** in current Slack documentation), add:
+
+- `message.channels`
+- `message.groups`
+- `message.im`
+- `message.mpim`
+
+Enable **Interactivity & Shortcuts**, then reinstall the Slack app as Mukil after changing scopes or event subscriptions. Copy the resulting **User OAuth Token** to `SLACK_USER_TOKEN` in `/etc/agent-ops.env`; never paste the token into chat. Restart the service with `sudo systemctl restart agent-ops`.
+
+User-scoped events cover public channels visible to Mukil plus private channels, DMs, and group DMs that Mukil can access. They do not expose private conversations Mukil cannot access. This removes the requirement to invite the Devy bot to every channel while preserving Slack's authorization boundary.
+
+For every message from another user containing either the exact Slack reference `<@SLACK_WATCH_USER_ID>` or a whole-word name from `SLACK_WATCH_NAMES`, Devy fetches up to `SLACK_CONTEXT_MESSAGES` preceding messages from the same channel, or the containing thread when the reference is threaded. It then runs Codex with a read-only sandbox against the configured repositories and posts:
+
+- urgency independent of whether the request belongs to Mukil;
+- relevance and its reason;
+- recommended action;
+- repository and feasibility;
+- implementation ideas and risks.
+
+Mukil can also DM Devy or mention `@Devy` with a question. A build request produces *Approve build* and *Reject* controls. Only `SLACK_WATCH_USER_ID` can approve. Approval creates an isolated worktree and `devy/slack-*` branch, runs Codex with workspace-only write access, commits and pushes the result, and opens a non-draft GitHub pull request with `gh`. Devy never merges. Text replies `approve`, `approve ID`, `reject`, or `reject ID` are accepted in the report thread as a fallback.
+
+The service user needs working Codex and GitHub CLI authentication. `gh auth status` must show `repo` access. Optional controls:
+
+```bash
+SLACK_TRIAGE_TIMEOUT_SECONDS=600
+SLACK_BUILD_TIMEOUT_SECONDS=3600
+SLACK_CODEX_MODEL=
+```
 
 ## tmux Detection
 
@@ -252,7 +349,7 @@ If a discovered Claude/Codex session remains in `waiting_for_input` for more tha
 Install and start the service:
 
 ```bash
-cd /home/ubuntu/apps/agent-ops
+cd /home/ubuntu/apps/devy
 npm install
 npm run build
 sudo scripts/install-systemd.sh
@@ -270,16 +367,17 @@ Service details:
 
 - Unit: `/etc/systemd/system/agent-ops.service`
 - Env file: `/etc/agent-ops.env`
-- Working directory: `/home/ubuntu/apps/agent-ops`
+- Working directory: `/home/ubuntu/apps/devy`
 - Start command: `npm run start`
 
 ## Acceptance Checks
 
 ```bash
-cd /home/ubuntu/apps/agent-ops
+cd /home/ubuntu/apps/devy
 npm install
 npm run build
 npm run typecheck
+npm test
 npm run start
 curl http://127.0.0.1:8787/api/health
 curl http://127.0.0.1:8787/api/status

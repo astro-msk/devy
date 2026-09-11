@@ -10,5 +10,5 @@ const server = createServer(app);
 attachTerminalBridge(server);
 
 server.listen(port, host, () => {
-  console.log(`agent-sessions listening on http://${host}:${port}`);
+  console.log(`Devy sessions listening on http://${host}:${port}`);
 });

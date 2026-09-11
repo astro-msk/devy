@@ -114,7 +114,7 @@ export function createApp(): Express {
   app.get("/api/health", (_req, res) => {
     res.json({
       ok: true,
-      app: "agent-ops",
+      app: "devy",
       time: new Date().toISOString(),
       hostname: os.hostname(),
       aiEnabled: aiConfigured(),
@@ -398,7 +398,7 @@ export function createApp(): Express {
   // Without this, a throw inside any handler yields Express's HTML error page
   // (or a hung request), which the client surfaces as an unparseable response.
   app.use((error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    console.error("[agent-ops] unhandled request error:", error);
+    console.error("[Devy] unhandled request error:", error);
     if (res.headersSent) return;
     res.status(500).json({ ok: false, error: error.message || "internal error" });
   });

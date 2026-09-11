@@ -1,5 +1,5 @@
 [Unit]
-Description=agent sessions PWA dashboard
+Description=Devy session dashboard
 After=network-online.target tailscaled.service
 Wants=network-online.target
 

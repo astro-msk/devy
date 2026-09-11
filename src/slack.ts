@@ -1,9 +1,10 @@
 import os from "node:os";
 import path from "node:path";
-import { App } from "@slack/bolt";
+import { App, LogLevel } from "@slack/bolt";
 import type { KnownBlock } from "@slack/types";
 import { getSlackThread, saveSlackThread, type EventRecord } from "./db.js";
 import { getGitStatus } from "./git.js";
+import { registerDevySlackAgent } from "./slack-agent.js";
 
 const alertTypes = new Set(["approval_required", "notification", "error"]);
 let slackApp: App | null = null;
@@ -20,6 +21,7 @@ type SlackThreadMessage = {
 };
 
 export function shouldAlert(type: string): boolean {
+  if (process.env.ENABLE_AGENT_ALERTS === "false") return false;
   return alertTypes.has(type);
 }
 
@@ -34,7 +36,7 @@ export async function sendSlackAlert(event: EventRecord, session: string, repoPa
   const repoName = path.basename(repoPath) || os.hostname();
   const message = humanSlackMessage(event.message, event.type);
   const title = titleForEvent(agentLabel, event.type, session, repoName);
-  const text = `[agent-ops] ${title}`;
+  const text = `[Devy] ${title}`;
   const blocks = buildAlertBlocks(title, event.type, agentLabel, session, git.branch, repoName, repoPath, message);
 
   if (botToken && channelId) {
@@ -110,6 +112,7 @@ export function startSlackInputListener(
   }
 
   const app = ensureSlackApp();
+  registerDevySlackAgent(app);
   app.message(async ({ message, say }) => {
     const userMessage = asGenericUserMessage(message);
     if (!userMessage) return;
@@ -176,12 +179,21 @@ export function cleanSlackMessageText(text: string): string {
   return s.trim();
 }
 
+function resolveSlackLogLevel(): LogLevel {
+  const requested = process.env.SLACK_LOG_LEVEL?.trim().toLowerCase();
+  if (requested === "debug") return LogLevel.DEBUG;
+  if (requested === "warn") return LogLevel.WARN;
+  if (requested === "error") return LogLevel.ERROR;
+  return LogLevel.INFO;
+}
+
 function ensureSlackApp(): App {
   if (!slackApp) {
     slackApp = new App({
       token: process.env.SLACK_BOT_TOKEN,
       appToken: process.env.SLACK_APP_TOKEN,
-      socketMode: process.env.SLACK_SOCKET_MODE === "true"
+      socketMode: process.env.SLACK_SOCKET_MODE === "true",
+      logLevel: resolveSlackLogLevel()
     });
   }
   return slackApp;

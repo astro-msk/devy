@@ -1,5 +1,5 @@
 {
-  "name": "agent-ops",
+  "name": "devy",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -8,6 +8,7 @@
     "manager:dev": "tsx watch src/session-manager.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/*.test.ts",
     "start": "node dist/server.js",
     "manager:start": "node dist/session-manager.js"
   },
