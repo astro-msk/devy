@@ -1,7 +1,8 @@
 import type { IncomingMessage, Server } from "node:http";
+import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
 import { z } from "zod";
-import { socketReadAllowed, socketWriteAllowed } from "./auth.js";
+import { isTunnelRequest, socketReadAllowed, socketWriteAllowed } from "./auth.js";
 import { simpleHash, tmux, tmuxKey, validSessionName } from "./sessions.js";
 
 const messageSchema = z.union([
@@ -21,7 +22,32 @@ const ACTIVE_POLL_MS = 140;
 const ACTIVE_WINDOW_MS = 2500;
 
 export function attachTerminalBridge(server: Server, basePath = "/ws/terminal"): WebSocketServer {
-  const wss = new WebSocketServer({ server, path: basePath, maxPayload: 64 * 1024 });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+
+  // The handshake is completed by hand so an unauthorised caller is turned
+  // away with a plain HTTP status before any WebSocket exists: 401 on the
+  // tunnel listener without a valid Access JWT, 403 off the tailnet.
+  server.on("upgrade", (request, socket, head) => {
+    const pathname = new URL(request.url || "", "http://localhost").pathname;
+    if (pathname !== basePath) {
+      rejectUpgrade(socket, 400, "Bad Request");
+      return;
+    }
+    socketReadAllowed(request)
+      .then((allowed) => {
+        if (!allowed) {
+          if (isTunnelRequest(request)) rejectUpgrade(socket, 401, "Unauthorized");
+          else rejectUpgrade(socket, 403, "Forbidden");
+          return;
+        }
+        wss.handleUpgrade(request, socket, head, (client) => wss.emit("connection", client, request));
+      })
+      .catch(() => rejectUpgrade(socket, 500, "Internal Server Error"));
+  });
+  server.on("close", () => {
+    for (const client of wss.clients) client.terminate();
+    wss.close();
+  });
 
   // Drop half-open connections (phone sleeps, wifi drops) instead of polling
   // tmux forever for a client that will never read the output.
@@ -55,22 +81,25 @@ async function handleConnection(socket: WebSocket, request: IncomingMessage): Pr
   const url = new URL(request.url || "", `http://${request.headers.host || "localhost"}`);
   const sessionName = url.searchParams.get("session") || "";
   const token = url.searchParams.get("token");
-  const remote = request.socket.remoteAddress;
 
   if (!validSessionName(sessionName)) {
     socket.close(1008, "invalid session");
     return;
   }
-  if (!socketReadAllowed(remote)) {
-    socket.close(1008, "tailnet access required");
-    return;
-  }
-  const canWrite = socketWriteAllowed(remote, token);
+  // Read access was already checked before the upgrade completed.
+  const canWrite = socketWriteAllowed(request, token);
 
   let lastHash = "";
   let closed = false;
   let lastChangeAt = Date.now();
   let timer: NodeJS.Timeout | null = null;
+
+  // Registered before the first await: a client that drops while the initial
+  // snapshot is still being captured must not leave the poll loop running.
+  socket.on("close", () => {
+    closed = true;
+    if (timer) clearTimeout(timer);
+  });
 
   safeSend(socket, { type: "ready", session: sessionName, canWrite });
 
@@ -109,7 +138,7 @@ async function handleConnection(socket: WebSocket, request: IncomingMessage): Pr
   // Self-rescheduling instead of setInterval: a slow tmux call can't stack up
   // overlapping captures, and the cadence follows activity.
   const schedule = () => {
-    if (closed) return;
+    if (closed || socket.readyState !== socket.OPEN) return;
     if (timer) clearTimeout(timer);
     const active = Date.now() - lastChangeAt < ACTIVE_WINDOW_MS;
     timer = setTimeout(() => void tick(), active ? ACTIVE_POLL_MS : IDLE_POLL_MS);
@@ -150,11 +179,6 @@ async function handleConnection(socket: WebSocket, request: IncomingMessage): Pr
     } catch (error) {
       safeSend(socket, { type: "error", message: (error as Error).message });
     }
-  });
-
-  socket.on("close", () => {
-    closed = true;
-    if (timer) clearTimeout(timer);
   });
 }
 
@@ -238,6 +262,13 @@ function splitTerminalInput(data: string): Array<{ type: "text" | "key"; value: 
   }
   flushText();
   return chunks;
+}
+
+function rejectUpgrade(socket: Duplex, status: number, text: string): void {
+  if (socket.writable) {
+    socket.write(`HTTP/1.1 ${status} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+  }
+  socket.destroy();
 }
 
 function safeSend(socket: WebSocket, payload: unknown): void {
