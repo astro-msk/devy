@@ -2,7 +2,7 @@
 
 Tailscale-only operations agent for watching Claude Code and Codex tmux sessions, triaging Slack references, and delivering approved code changes as pull requests.
 
-This MVP intentionally has no browser login. Tailscale is the access layer. Do not expose port `8787` to the public internet.
+This MVP intentionally has no browser login of its own. Tailscale is the access layer. Do not expose ports `8787`, `8790` or `8791` to the public internet. The one supported public path is a Cloudflare Tunnel in front of Cloudflare Access, described in [Public access via Cloudflare Tunnel + Access](#public-access-via-cloudflare-tunnel--access).
 
 ## What It Does
 
@@ -317,6 +317,67 @@ SLACK_TRIAGE_TIMEOUT_SECONDS=600
 SLACK_BUILD_TIMEOUT_SECONDS=3600
 SLACK_CODEX_MODEL=
 ```
+
+## Public access via Cloudflare Tunnel + Access
+
+Devy can be reached from a phone off the tailnet through a Cloudflare Tunnel, with Cloudflare Access doing the login. Nothing new is opened on the box: cloudflared makes an outbound connection to Cloudflare and forwards each public hostname to a loopback-only listener that Devy adds next to its tailnet ports.
+
+| Public hostname | Tunnel target | Serves |
+| --- | --- | --- |
+| `devy.mukilsenthil.com` | `http://localhost:8797` (`TUNNEL_PORT`) | dashboard (`agent-ops`) |
+| `sessions.devy.mukilsenthil.com` | `http://localhost:8798` (`MANAGER_TUNNEL_PORT`) | session manager (`agent-sessions`) |
+
+How the origin treats those two listeners (`src/auth.ts`, `src/cf-access.ts`):
+
+- Every connection accepted on 8797/8798 is marked as a tunnel connection at the socket level. It is never treated as localhost, even though cloudflared connects from `127.0.0.1`, and `cf-*` headers are never trusted on their own.
+- Every request — `/api/health`, static files, API calls and the WebSocket terminal upgrade — is refused with `401` until the `Cf-Access-Jwt-Assertion` header carries a JWT that verifies against the team's JWKS (`https://<team>/cdn-cgi/access/certs`, cached, refetched on an unknown key id): RS256 signature, `aud` = `CF_ACCESS_AUD`, `iss` = `https://<team>`, `exp`/`nbf`, and an `email` claim in `CF_ACCESS_ALLOWED_EMAILS` (case-insensitive).
+- A verified caller gets tailnet privileges: reads work, writes still require `AGENT_OPS_TOKEN` as a Bearer token (the PWA asks once and keeps it in local storage). The Access login alone never authorises a write. Writes through the tunnel are also rate limited (120/minute per identity).
+- If `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD` or `CF_ACCESS_ALLOWED_EMAILS` is missing, the tunnel listeners refuse everything and the service logs a warning at startup. The tailnet listeners on 8787/8790 keep their `TAILSCALE_ONLY` behaviour unchanged.
+
+### Zero Trust dashboard
+
+1. **Tunnel.** Zero Trust → *Networks* → *Tunnels* → *Create a tunnel* → *Cloudflared*. Name it `devy`. On *Install and run a connector*, copy the token from the command shown (the long string after `--token`). Do not run the command; the box uses the systemd unit below. Click *Next*.
+2. **Public hostnames.** In the tunnel's *Public Hostname* tab add two entries:
+   - Subdomain `devy`, domain `mukilsenthil.com`, service type `HTTP`, URL `localhost:8797`.
+   - Subdomain `sessions.devy`, domain `mukilsenthil.com`, service type `HTTP`, URL `localhost:8798`.
+   Cloudflare creates the DNS records. No local `config.yml`, `cert.pem` or `cloudflared tunnel login` is involved.
+3. **Access application.** Zero Trust → *Access* → *Applications* → *Add an application* → *Self-hosted*. Name it `Devy`, add both public hostnames (`devy.mukilsenthil.com` and `sessions.devy.mukilsenthil.com`) so they share one application, pick a session duration.
+4. **Policy.** Add a policy with action **Allow**, include rule *Emails* = `mukil@noso.so`. Keep at least one login method enabled (One-time PIN is enough). Save the application.
+5. **Copy the two values the origin needs.** Open the application → *Overview* (Basic information) and copy the **Application Audience (AUD) Tag**. The **team domain** is under Zero Trust → *Settings* → *Custom Pages* and looks like `<team>.cloudflareaccess.com`.
+
+### Environment
+
+Add to `/etc/agent-ops.env` (values only there, never in the repo):
+
+```bash
+CLOUDFLARE_TUNNEL_TOKEN=<token copied in step 1>
+CF_ACCESS_TEAM_DOMAIN=<team>.cloudflareaccess.com
+CF_ACCESS_AUD=<AUD tag copied in step 5>
+CF_ACCESS_ALLOWED_EMAILS=mukil@noso.so
+# optional, these are the defaults
+TUNNEL_PORT=8797
+MANAGER_TUNNEL_PORT=8798
+```
+
+### cloudflared on the box
+
+`cloudflared` comes from Cloudflare's apt repository (`https://pkg.cloudflare.com/cloudflared`, signed with the key in `/usr/share/keyrings/cloudflare-main.gpg`). The unit `systemd/cloudflared.service` runs `cloudflared tunnel --no-autoupdate run` with the token taken from `CLOUDFLARE_TUNNEL_TOKEN` in `/etc/agent-ops.env` (passed as `TUNNEL_TOKEN` in the environment so it does not show up in `ps`). `scripts/install-systemd.sh` installs the unit but leaves it disabled.
+
+```bash
+scripts/cloudflare-tunnel.sh status    # unit state, which CF vars are set (names only), 8797/8798 listening?
+scripts/cloudflare-tunnel.sh enable    # preflight, then systemctl enable --now cloudflared
+scripts/cloudflare-tunnel.sh start|stop|disable|logs
+```
+
+### Go-live order
+
+1. Deploy this code: `npm ci && npm run build`, then `sudo systemctl restart agent-ops agent-sessions`. The journal should show `tunnel listener on http://127.0.0.1:8797` (and 8798) and, once the variables are in place, `Cloudflare Access enforced on tunnel listener`.
+2. Do the dashboard steps above and add the environment lines; restart `agent-ops` and `agent-sessions` again so they pick up `CF_ACCESS_*`.
+3. Confirm the origin fails closed before anything is public: `curl -i http://127.0.0.1:8797/api/health` must return `401` with `"cloudflare access required"`, and so must `curl -i -H 'cf-access-authenticated-user-email: mukil@noso.so' http://127.0.0.1:8797/`.
+4. `scripts/cloudflare-tunnel.sh enable`. The tunnel shows *Healthy* in Zero Trust → Networks → Tunnels within a minute.
+5. From a phone with Tailscale off, open `https://devy.mukilsenthil.com`: Cloudflare Access asks for the email and a one-time code, then the dashboard loads. Paste `AGENT_OPS_TOKEN` in *Settings* once to enable writes. An unauthenticated `curl -i https://devy.mukilsenthil.com/api/health` must answer with a `302` to the Access login page, never with `200`.
+
+To take the public path down again: `scripts/cloudflare-tunnel.sh disable`. The tailnet listeners are unaffected either way.
 
 ## tmux Detection
 

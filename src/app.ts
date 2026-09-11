@@ -5,7 +5,8 @@ import { fileURLToPath } from "node:url";
 import { mkdir, readFile, statfs, writeFile } from "node:fs/promises";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { z } from "zod";
-import { requireTailnetRead, requireWriteAuth } from "./auth.js";
+import { requireTailnetRead, requireTunnelAccess, requireWriteAuth } from "./auth.js";
+import { securityHeaders } from "./security-headers.js";
 import { activeModel, aiConfigured, providerName, streamAsk } from "./ai.js";
 import {
   deleteConversation,
@@ -120,6 +121,10 @@ export function createApp(): Express {
   const projectRoot = path.resolve(__dirname, "..");
 
   app.set("trust proxy", false);
+  app.use(securityHeaders);
+  // Before the body parser and the static files: a request on the Cloudflare
+  // tunnel listener gets 401 here unless it carries a valid Access JWT.
+  app.use(requireTunnelAccess);
   app.use(express.json({ limit: "1mb" }));
   app.use(requireTailnetRead);
 
