@@ -229,11 +229,15 @@ export async function probeRoute(route: RouteDef): Promise<ProbeResult> {
   await gatewayRequest("PUT", `/sessions/${session}`, { route: route.id, mode: "pinned", account: spec.account });
   const env = { ...process.env, ...spec.env };
   const prompt = "Reply with exactly: PROBE_OK";
+  // No `--bare` for claude: bare mode skips the claude.ai login, which is the
+  // very thing a passthrough probe exercises. stdin is closed so neither client
+  // waits on a pipe.
+  const opts = { env, timeout: 120_000, maxBuffer: 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] as const };
   try {
     const { stdout, stderr } =
       route.lane === "claude"
-        ? await execFileAsync("claude", ["-p", prompt, "--max-turns", "1", "--no-session-persistence", "--bare", "--model", "haiku", ...spec.args], { env, timeout: 120_000, maxBuffer: 1024 * 1024 })
-        : await execFileAsync("codex", ["exec", "--skip-git-repo-check", "-C", "/tmp", ...spec.args, prompt], { env, timeout: 120_000, maxBuffer: 1024 * 1024 });
+        ? await execFileAsync("claude", ["-p", prompt, "--max-turns", "1", "--no-session-persistence", "--model", "haiku", ...spec.args], opts)
+        : await execFileAsync("codex", ["exec", "--skip-git-repo-check", "-C", "/tmp", ...spec.args, prompt], opts);
     const output = `${stdout}\n${stderr}`.trim();
     const ok = /PROBE_OK/.test(output);
     return { ok, via: "client", ms: Date.now() - started, output: tail(output), error: ok ? undefined : "client did not answer PROBE_OK" };
