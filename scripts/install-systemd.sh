@@ -6,6 +6,7 @@ ENV_FILE="/etc/agent-ops.env"
 SERVICE_FILE="/etc/systemd/system/agent-ops.service"
 MANAGER_SERVICE_FILE="/etc/systemd/system/agent-sessions.service"
 GATEWAY_SERVICE_FILE="/etc/systemd/system/agent-gateway.service"
+CLOUDFLARED_SERVICE_FILE="/etc/systemd/system/cloudflared.service"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Run with sudo: sudo $0"
@@ -28,6 +29,13 @@ chmod 644 "$SERVICE_FILE"
 chmod 644 "$MANAGER_SERVICE_FILE"
 sed "s#__AGENT_OPS_DIR__#$APP_DIR#g" "$APP_DIR/systemd/agent-gateway.service" > "$GATEWAY_SERVICE_FILE"
 chmod 644 "$GATEWAY_SERVICE_FILE"
+# The Cloudflare Tunnel unit is installed but deliberately neither enabled nor
+# started: go live with scripts/cloudflare-tunnel.sh enable once the Access
+# variables are in the env file (see README).
+if command -v cloudflared >/dev/null; then
+  cp "$APP_DIR/systemd/cloudflared.service" "$CLOUDFLARED_SERVICE_FILE"
+  chmod 644 "$CLOUDFLARED_SERVICE_FILE"
+fi
 systemctl daemon-reload
 systemctl enable agent-ops
 systemctl enable agent-sessions

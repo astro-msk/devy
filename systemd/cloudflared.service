@@ -1,0 +1,23 @@
+[Unit]
+Description=Cloudflare Tunnel "devy" (publishes the Devy tunnel listeners behind Cloudflare Access)
+Documentation=https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
+After=network-online.target agent-ops.service agent-sessions.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The same env file the Devy services read; only CLOUDFLARE_TUNNEL_TOKEN is used here.
+EnvironmentFile=/etc/agent-ops.env
+# cloudflared takes the token from TUNNEL_TOKEN. Handing it over through the
+# environment instead of `--token <value>` keeps it out of `ps` output.
+ExecStart=/bin/sh -c 'TUNNEL_TOKEN="$CLOUDFLARE_TUNNEL_TOKEN" exec /usr/bin/cloudflared tunnel --no-autoupdate run'
+Restart=on-failure
+RestartSec=5
+User=ubuntu
+Group=ubuntu
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
