@@ -146,7 +146,10 @@ export function configureAccess(config: AccessConfig | null): AccessVerifier | n
   return verifier;
 }
 
+// Initialises from the environment unless configureAccess() was already called
+// explicitly (tests point the verifier at a local JWKS that way).
 export function initAccessFromEnv(): { verifier: AccessVerifier | null; missing: string[] } {
+  if (verifier !== undefined) return { verifier, missing: [] };
   const { config, missing } = accessConfigFromEnv();
   return { verifier: configureAccess(config), missing };
 }

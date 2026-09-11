@@ -25,6 +25,7 @@ const { createApp } = await import("./app.js");
 const { markTunnelServer, tunnelWriteLimiter } = await import("./auth.js");
 const { configureAccess } = await import("./cf-access.js");
 const { attachTerminalBridge } = await import("./terminal-bridge.js");
+const { startTunnelListener } = await import("./tunnel-listener.js");
 
 let fake: FakeAccess;
 const bridges: WebSocketServer[] = [];
@@ -184,6 +185,32 @@ test("WebSocket upgrade on an unknown path gets 400", async () => {
   const status = await upgradeStatus(`${wsUrl(plainUrl)}/ws/other`);
   assert.equal(status, 400);
 });
+
+test("startTunnelListener serves the app on loopback with Access enforced, and 0 disables it", async () => {
+  assert.equal(startTunnelListener(createApp(), 0, "test"), null);
+
+  const port = await freePort();
+  const server = startTunnelListener(createApp(), port, "test");
+  assert.ok(server);
+  try {
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    const url = `http://127.0.0.1:${port}/api/health`;
+    assert.equal((await fetch(url)).status, 401);
+    assert.equal((await fetch(url, { headers: { "cf-access-jwt-assertion": jwt } })).status, 200);
+  } finally {
+    await close(server);
+  }
+});
+
+function freePort(): Promise<number> {
+  return new Promise((resolve) => {
+    const probe = createServer();
+    probe.listen(0, "127.0.0.1", () => {
+      const { port } = probe.address() as AddressInfo;
+      probe.close(() => resolve(port));
+    });
+  });
+}
 
 function listen(server: Server): Promise<string> {
   return new Promise((resolve) =>
