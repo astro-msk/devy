@@ -1,5 +1,5 @@
-const CACHE_NAME = "devy-v17";
-const ASSETS = ["/", "/index.html", "/styles.css", "/app.js", "/manifest.json", "/icon.svg"];
+const CACHE_NAME = "devy-v18";
+const ASSETS = ["/", "/index.html", "/styles.css", "/app.js", "/gateway.js", "/manifest.json", "/icon.svg"];
 
 self.addEventListener("install", (event) => {
   self.skipWaiting();

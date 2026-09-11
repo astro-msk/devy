@@ -439,6 +439,9 @@ function openNewSessionModal(prefill = {}) {
             </select>
           </label>
           <label>Directory<input name="directory" required value="${escapeHtml(prefill.directory || "/home/ubuntu/work/repos/Pilot")}" /></label>
+          <label>Route <span class="muted small">(provider via the gateway)</span>
+            <select name="route"><option value="direct">Loading…</option></select>
+          </label>
           <div class="btn-row" style="justify-content:flex-end;">
             <button type="button" class="btn btn-ghost" id="modal-cancel">Cancel</button>
             <button type="submit" class="btn btn-primary">Create</button>
@@ -451,6 +454,20 @@ function openNewSessionModal(prefill = {}) {
   const close = () => modal.remove();
   $("#modal-cancel", modal).addEventListener("click", close);
   modal.addEventListener("click", (e) => { if (e.target === modal) close(); });
+  // Route options depend on the agent (Claude routes vs Codex routes).
+  const routeSelect = $('select[name="route"]', modal);
+  const agentSelect = $('select[name="agent"]', modal);
+  async function fillRoutes() {
+    const lane = agentSelect.value;
+    const routes = window.gatewayRoutesFor ? await window.gatewayRoutesFor(lane) : [];
+    const opts = routes.map((r) => {
+      const needsLogin = r.account && !r.account.signedIn;
+      return `<option value="${r.id}" ${r.isDefault && !needsLogin ? "selected" : ""} ${needsLogin ? "disabled" : ""}>${escapeHtml(r.label)}${needsLogin ? " — sign in first" : ""}</option>`;
+    });
+    routeSelect.innerHTML = `${opts.join("")}<option value="direct" ${opts.length ? "" : "selected"}>Direct (no gateway)</option>`;
+  }
+  agentSelect.addEventListener("change", fillRoutes);
+  fillRoutes();
   $("#new-session-form", modal).addEventListener("submit", async (e) => {
     e.preventDefault();
     const f = e.currentTarget;
@@ -461,6 +478,7 @@ function openNewSessionModal(prefill = {}) {
           name: f.elements.name.value.trim(),
           agent: f.elements.agent.value,
           directory: f.elements.directory.value.trim(),
+          route: f.elements.route.value,
         }),
       });
       toast(`Created ${f.elements.name.value}`, "ok");
@@ -1454,6 +1472,7 @@ function paletteItems() {
     { kind: "page", label: "Projects", href: "#projects" },
     { kind: "page", label: "AI", href: "#ai" },
     { kind: "page", label: "Events", href: "#events" },
+    { kind: "page", label: "Gateway", href: "#gateway" },
     { kind: "page", label: "Settings", href: "#settings" },
     { kind: "action", label: "New session…", action: () => openNewSessionModal() },
   ];
@@ -1536,6 +1555,9 @@ $$(".nav-item, .bottom-tabs a").forEach((a) => {
     document.body.classList.remove("nav-open");
   });
 });
+
+// Helpers shared with pages that live in their own module (see gateway.js).
+window.Devy = { route, api, $, $$, h, escapeHtml, toast, formatUptime, stateLabels, currentRoute, navigate, State };
 
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(() => {});
