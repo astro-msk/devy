@@ -18,6 +18,20 @@ import {
   searchMemories
 } from "./ai-memory.js";
 import { getRecentEvents } from "./db.js";
+import { findAccount, gatewayUrl } from "./gateway-config.js";
+import {
+  accountStatuses,
+  findRoute,
+  gatewayRequest,
+  gatewayState,
+  launchCommand,
+  launchSpec,
+  loginCommand,
+  loginSessionName,
+  probeRoute,
+  signOut,
+  type LaunchSpec
+} from "./gateway-client.js";
 import {
   getCachedStatuses,
   getObservedSessions,
@@ -64,8 +78,13 @@ const createSessionSchema = z.object({
     .max(80)
     .regex(/^[A-Za-z0-9_.:-]+$/),
   agent: z.enum(["claude", "codex"]),
-  directory: z.string().min(1).max(500)
+  directory: z.string().min(1).max(500),
+  /** Gateway route id; omitted or "direct" launches the agent with its own default provider. */
+  route: z.string().max(60).optional()
 });
+
+const routeIdSchema = z.string().min(1).max(60).regex(/^[a-z0-9-]+$/);
+const accountIdSchema = z.string().min(1).max(60).regex(/^[a-z0-9-]+$/);
 
 const claudePermissionSchema = z.object({
   directory: z.string().min(1).max(500),
@@ -219,12 +238,79 @@ export function createApp(): Express {
       return;
     }
     try {
-      await createManagedSession(parsed.data.name, parsed.data.agent, parsed.data.directory);
-      res.status(201).json({ ok: true });
+      const { name, agent, directory, route: routeId } = parsed.data;
+      let launch: string | undefined;
+      let spec: LaunchSpec | null = null;
+      if (routeId && routeId !== "direct") {
+        const route = findRoute(routeId);
+        if (!route || route.lane !== agent) throw new Error(`unknown ${agent} route: ${routeId}`);
+        spec = await launchSpec(agent, name, route);
+        launch = launchCommand(agent, spec);
+        // Register before launch so the first request already resolves to the chosen route.
+        await gatewayRequest("PUT", `/sessions/${name}`, { route: route.id, mode: "auto", account: spec.account });
+      }
+      await createManagedSession(name, agent, directory, launch);
+      res.status(201).json({ ok: true, route: spec ? routeId : "direct", account: spec?.account ?? null });
     } catch (error) {
       res.status(400).json({ ok: false, error: (error as Error).message });
     }
   });
+
+  // ── Gateway: routes, accounts, per-session switching ─────────────────────
+  app.get("/api/gateway/state", async (_req, res) => {
+    const [gateway, accounts, sessions] = await Promise.all([gatewayState(), accountStatuses(), listManagedSessions()]);
+    res.json({ ...gateway, url: gatewayUrl(), accounts, sessions: sessions.map((s) => ({ name: s.name, agent: s.agent, state: s.state })) });
+  });
+
+  const gatewayWrite = async (req: express.Request, res: express.Response, run: () => Promise<unknown>) => {
+    try {
+      res.json(await run());
+    } catch (error) {
+      res.status(400).json({ ok: false, error: (error as Error).message });
+    }
+  };
+
+  app.put("/api/gateway/settings", requireWriteAuth, (req, res) =>
+    gatewayWrite(req, res, () => gatewayRequest("PUT", "/settings", req.body)));
+
+  app.put("/api/gateway/routes/:route", requireWriteAuth, (req, res) =>
+    gatewayWrite(req, res, () => gatewayRequest("PUT", `/routes/${routeIdSchema.parse(req.params.route)}`, req.body)));
+
+  app.post("/api/gateway/routes/:route/reset", requireWriteAuth, (req, res) =>
+    gatewayWrite(req, res, () => gatewayRequest("POST", `/routes/${routeIdSchema.parse(req.params.route)}/reset`)));
+
+  app.post("/api/gateway/routes/:route/test", requireWriteAuth, (req, res) =>
+    gatewayWrite(req, res, async () => {
+      const route = findRoute(routeIdSchema.parse(req.params.route));
+      if (!route) throw new Error("unknown route");
+      return probeRoute(route);
+    }));
+
+  app.put("/api/gateway/sessions/:session", requireWriteAuth, (req, res) =>
+    gatewayWrite(req, res, () => gatewayRequest("PUT", `/sessions/${sessionNameSchema.parse(req.params.session)}`, req.body)));
+
+  app.delete("/api/gateway/sessions/:session", requireWriteAuth, (req, res) =>
+    gatewayWrite(req, res, () => gatewayRequest("DELETE", `/sessions/${sessionNameSchema.parse(req.params.session)}`)));
+
+  app.post("/api/gateway/accounts/:account/login", requireWriteAuth, (req, res) =>
+    gatewayWrite(req, res, async () => {
+      const account = findAccount(accountIdSchema.parse(req.params.account));
+      if (!account) throw new Error("unknown account");
+      const session = loginSessionName(account.id);
+      const live = await listManagedSessions(true);
+      if (!live.some((s) => s.name === session)) {
+        await createManagedSession(session, account.lane, process.env.HOME || "/home/ubuntu", await loginCommand(account));
+      }
+      return { ok: true, session };
+    }));
+
+  app.post("/api/gateway/accounts/:account/logout", requireWriteAuth, (req, res) =>
+    gatewayWrite(req, res, async () => {
+      const account = findAccount(accountIdSchema.parse(req.params.account));
+      if (!account) throw new Error("unknown account");
+      await signOut(account);
+      return { ok: true };
+    }));
 
   app.post("/api/sessions/:session/input", requireWriteAuth, async (req, res) => {
     const sessionName = String(req.params.session || "");
@@ -273,6 +359,7 @@ export function createApp(): Express {
       const result = await tmux(["kill-session", "-t", sessionName]);
       if (result.code !== 0) throw new Error(result.stderr.trim() || "tmux kill-session failed");
       invalidateSessionCache();
+      gatewayRequest("DELETE", `/sessions/${sessionName}`).catch(() => {/* gateway down or session never routed */});
       res.json({ ok: true });
     } catch (error) {
       res.status(400).json({ ok: false, error: (error as Error).message });

@@ -1,0 +1,17 @@
+[Unit]
+Description=Devy agent gateway (routes Claude Code / Codex traffic to providers)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__AGENT_OPS_DIR__
+EnvironmentFile=/etc/agent-ops.env
+ExecStart=/usr/bin/npm run gateway:start
+Restart=always
+RestartSec=2
+User=ubuntu
+Group=ubuntu
+
+[Install]
+WantedBy=multi-user.target

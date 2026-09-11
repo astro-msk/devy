@@ -10,7 +10,9 @@
     "typecheck": "tsc --noEmit",
     "test": "tsx --test src/*.test.ts",
     "start": "node dist/server.js",
-    "manager:start": "node dist/session-manager.js"
+    "manager:start": "node dist/session-manager.js",
+    "gateway:dev": "tsx watch src/gateway.ts",
+    "gateway:start": "node dist/gateway.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.98.0",

@@ -5,6 +5,7 @@ APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="/etc/agent-ops.env"
 SERVICE_FILE="/etc/systemd/system/agent-ops.service"
 MANAGER_SERVICE_FILE="/etc/systemd/system/agent-sessions.service"
+GATEWAY_SERVICE_FILE="/etc/systemd/system/agent-gateway.service"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Run with sudo: sudo $0"
@@ -25,10 +26,15 @@ sed "s#__AGENT_OPS_DIR__#$APP_DIR#g" "$APP_DIR/systemd/agent-ops.service" > "$SE
 sed "s#__AGENT_OPS_DIR__#$APP_DIR#g" "$APP_DIR/systemd/agent-sessions.service" > "$MANAGER_SERVICE_FILE"
 chmod 644 "$SERVICE_FILE"
 chmod 644 "$MANAGER_SERVICE_FILE"
+sed "s#__AGENT_OPS_DIR__#$APP_DIR#g" "$APP_DIR/systemd/agent-gateway.service" > "$GATEWAY_SERVICE_FILE"
+chmod 644 "$GATEWAY_SERVICE_FILE"
 systemctl daemon-reload
 systemctl enable agent-ops
 systemctl enable agent-sessions
+systemctl enable agent-gateway
 systemctl restart agent-ops
 systemctl restart agent-sessions
+systemctl restart agent-gateway
 systemctl status agent-ops --no-pager
 systemctl status agent-sessions --no-pager
+systemctl status agent-gateway --no-pager
