@@ -140,7 +140,9 @@ export async function launchSpec(lane: Lane, session: string, route: RouteDef, a
   if (account) await prepareAccountDir(account);
 
   if (lane === "claude") {
-    const env: Record<string, string> = { ANTHROPIC_BASE_URL: base };
+    // Blank ANTHROPIC_API_KEY so a key in the launching shell's environment
+    // can't shadow the account login (the gateway injects real keys itself).
+    const env: Record<string, string> = { ANTHROPIC_BASE_URL: base, ANTHROPIC_API_KEY: "" };
     if (account && !account.isDefaultHome) env.CLAUDE_CONFIG_DIR = account.dir;
     if (!account) env.ANTHROPIC_AUTH_TOKEN = "devy-gateway";
     return { env, args: [], account: account?.id ?? null };
@@ -227,7 +229,13 @@ export async function probeRoute(route: RouteDef): Promise<ProbeResult> {
   const session = `${PROBE_PREFIX}${route.id}`;
   const spec = await launchSpec(route.lane, session, route);
   await gatewayRequest("PUT", `/sessions/${session}`, { route: route.id, mode: "pinned", account: spec.account });
-  const env = { ...process.env, ...spec.env };
+  // The dashboard runs under systemd with provider keys in its environment
+  // (ANTHROPIC_API_KEY for the AI panel, etc.). A child client would prefer
+  // those over the account login and over the gateway, so strip them.
+  const env: NodeJS.ProcessEnv = { ...process.env, ...spec.env };
+  for (const key of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "AZURE_OPENAI_API_KEY", "AWS_BEARER_TOKEN_BEDROCK"]) {
+    if (!(key in spec.env)) delete env[key];
+  }
   const prompt = "Reply with exactly: PROBE_OK";
   // No `--bare` for claude: bare mode skips the claude.ai login, which is the
   // very thing a passthrough probe exercises. stdin is closed so neither client
