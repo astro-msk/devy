@@ -149,7 +149,7 @@ test("redacts credentials from Slack reports", () => {
       relevant: true,
       relevanceReason: "authorization=xoxb-example-secret",
       summary: "token=xoxb-example-secret",
-      recommendedAction: "Rotate ghp_examplecredentialvalue12345678901234567890",
+      recommendedAction: "Rotate ghp_FAKE_redaction_fixture",
       requestType: "action_required",
       repository: "none",
       feasibility: "not_applicable",
@@ -161,7 +161,7 @@ test("redacts credentials from Slack reports", () => {
   );
   const serialized = JSON.stringify(blocks);
   assert.equal(serialized.includes("xoxb-example-secret"), false);
-  assert.equal(serialized.includes("ghp_examplecredentialvalue12345678901234567890"), false);
+  assert.equal(serialized.includes("ghp_FAKE_redaction_fixture"), false);
   assert.match(serialized, /redacted/);
 });
 

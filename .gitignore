@@ -1,5 +1,14 @@
 node_modules/
 dist/
 data/
-.env
 *.sqlite*
+
+# Real env files hold live API keys and Slack tokens. Only the template is tracked.
+.env
+.env.*
+!.env.example
+
+# Local tool state and logs
+.claude/
+*.log
+.DS_Store

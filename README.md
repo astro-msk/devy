@@ -296,7 +296,7 @@ Under **Event Subscriptions → Subscribe to bot events**, add `app_mention` and
 - `message.im`
 - `message.mpim`
 
-Enable **Interactivity & Shortcuts**, then reinstall the Slack app as Mukil after changing scopes or event subscriptions. Copy the resulting **User OAuth Token** to `SLACK_USER_TOKEN` in `/etc/agent-ops.env`; never paste the token into chat. Restart the service with `sudo systemctl restart agent-ops`.
+Enable **Interactivity & Shortcuts**, then reinstall the Slack app as the watched user after changing scopes or event subscriptions. Copy the resulting **User OAuth Token** to `SLACK_USER_TOKEN` in `/etc/agent-ops.env`; never paste the token into chat. Restart the service with `sudo systemctl restart agent-ops`.
 
 User-scoped events cover public channels visible to Mukil plus private channels, DMs, and group DMs that Mukil can access. They do not expose private conversations Mukil cannot access. This removes the requirement to invite the Devy bot to every channel while preserving Slack's authorization boundary.
 
