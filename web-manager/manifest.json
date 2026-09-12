@@ -1,17 +1,36 @@
 {
-  "name": "Devy Agent Sessions",
-  "short_name": "Devy",
-  "description": "Manage Claude and Codex tmux sessions by branch",
-  "start_url": "/",
+  "id": "./",
+  "name": "Devy Remote",
+  "short_name": "Devy Remote",
+  "description": "Remote control for Claude Code and Codex tmux sessions: see who needs you, reply in one tap, switch providers.",
+  "start_url": "./",
+  "scope": "./",
   "display": "standalone",
-  "background_color": "#11161d",
-  "theme_color": "#18202b",
+  "orientation": "any",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "categories": [
+    "developer tools",
+    "utilities"
+  ],
   "icons": [
     {
-      "src": "/icon.svg",
-      "sizes": "any",
-      "type": "image/svg+xml",
-      "purpose": "any maskable"
+      "src": "./icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
     }
   ]
 }

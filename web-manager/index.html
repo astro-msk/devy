@@ -3,59 +3,178 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="theme-color" content="#18202b" />
-    <link rel="manifest" href="/manifest.json" />
-    <link rel="stylesheet" href="/styles.css" />
-    <title>Devy Agent Sessions</title>
+    <meta name="theme-color" content="#000000" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Devy Remote" />
+    <link rel="manifest" href="./manifest.json" />
+    <link rel="icon" href="./icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" sizes="180x180" />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" />
+    <link rel="stylesheet" href="./styles.css" />
+    <title>Devy Remote</title>
   </head>
   <body>
-    <main>
+    <main class="app">
       <header class="topbar">
-        <div>
-          <h1>Devy</h1>
-          <p id="health">Connecting...</p>
+        <div class="brand">
+          <h1>Devy <span>remote</span></h1>
+          <p id="health" class="health" aria-live="polite">Connecting</p>
         </div>
-        <button id="refresh" type="button">Refresh</button>
+        <div class="topbar-actions">
+          <button id="open-token" type="button" class="icon-button" title="Write token" aria-label="Write token">
+            <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M14.5 9.5a4 4 0 1 0-4 4l-6.5 6.5V22h2l6.5-6.5a4 4 0 0 0 2-6z"/><circle cx="16" cy="8" r="1.4" fill="currentColor"/></svg>
+          </button>
+          <button id="refresh" type="button" class="icon-button" title="Refresh (r)" aria-label="Refresh">
+            <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M20 12a8 8 0 1 1-2.34-5.66M20 4v5h-5"/></svg>
+          </button>
+          <button id="new-session" type="button" class="primary" title="New session (n)">New session</button>
+        </div>
       </header>
 
-      <button id="update-banner" class="update-banner" type="button" hidden>Update available. Tap to reload.</button>
+      <div id="notices" class="notices" aria-live="polite"></div>
 
-      <section class="filters" aria-label="Session filters">
-        <button class="filter active" data-filter="all" type="button">All</button>
-        <button class="filter" data-filter="claude" type="button">Claude</button>
-        <button class="filter" data-filter="codex" type="button">Codex</button>
-        <button class="filter" data-filter="waiting_for_input" type="button">Needs input</button>
-      </section>
+      <nav class="filters" aria-label="Show">
+        <button class="filter active" data-filter="all" type="button" aria-pressed="true">All<span class="count" data-count="all"></span></button>
+        <button class="filter" data-filter="waiting_for_input" type="button" aria-pressed="false">Needs you<span class="count" data-count="waiting_for_input"></span></button>
+        <button class="filter" data-filter="claude" type="button" aria-pressed="false">Claude<span class="count" data-count="claude"></span></button>
+        <button class="filter" data-filter="codex" type="button" aria-pressed="false">Codex<span class="count" data-count="codex"></span></button>
+      </nav>
 
-      <section class="create-panel">
-        <details>
-          <summary>New tmux session</summary>
-          <form id="create-session-form">
-            <div class="field-row">
-              <label>
-                Agent
-                <select name="agent">
-                  <option value="codex">Codex</option>
-                  <option value="claude">Claude</option>
-                </select>
-              </label>
-              <label>
-                Name
-                <input name="name" autocomplete="off" placeholder="codex-feature-x" required />
-              </label>
-            </div>
-            <label>
-              Directory
-              <input name="directory" autocomplete="off" value="/home/ubuntu/apps" required />
-            </label>
-            <button type="submit">Create</button>
-          </form>
-        </details>
-      </section>
+      <section id="feed" class="feed" aria-label="Sessions"></section>
 
-      <section id="sessions" class="sessions" aria-live="polite"></section>
+      <footer class="shortcuts" aria-hidden="true">
+        <span><kbd>j</kbd><kbd>k</kbd> move</span>
+        <span><kbd>o</kbd> open</span>
+        <span><kbd>/</kbd> reply</span>
+        <span><kbd>r</kbd> refresh</span>
+        <span><kbd>n</kbd> new</span>
+        <span><kbd>?</kbd> help</span>
+      </footer>
     </main>
 
-    <script src="/app.js" type="module"></script>
+    <template id="card-template">
+      <article class="card" data-session="">
+        <button class="head" type="button" aria-expanded="false">
+          <span class="rail"></span>
+          <span class="head-main">
+            <span class="head-row">
+              <strong class="name"></strong>
+              <span class="state"><span class="state-label"></span><span class="state-age"></span></span>
+            </span>
+            <span class="head-sub">
+              <span class="chip branch"></span>
+              <span class="chip dirty" hidden>uncommitted changes</span>
+              <span class="chip command"></span>
+              <span class="chip route-summary"></span>
+            </span>
+          </span>
+          <svg class="chevron" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6"/></svg>
+        </button>
+
+        <div class="body" hidden>
+          <div class="tools">
+            <button class="route-chip" type="button" aria-expanded="false"></button>
+            <span class="path"></span>
+            <span class="kill-wrap">
+              <button class="kill" type="button">Kill session</button>
+              <span class="kill-confirm" hidden>
+                <button class="kill-yes danger" type="button">Yes, kill it</button>
+                <button class="kill-no" type="button">Keep</button>
+              </span>
+            </span>
+          </div>
+          <div class="route-menu" hidden></div>
+
+          <div class="prompt" hidden><p></p></div>
+
+          <form class="composer" autocomplete="off">
+            <textarea class="compose" rows="1" placeholder="Reply, Enter sends" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="Reply"></textarea>
+            <button class="type-only" type="button" title="Type without pressing Enter (Ctrl+Enter)">Type</button>
+            <button class="send primary" type="submit" title="Send and press Enter">Send</button>
+          </form>
+
+          <div class="screen-wrap">
+            <pre class="screen" tabindex="0" aria-label="Last screen"></pre>
+            <button class="screen-toggle" type="button" aria-label="Show more of the screen">More</button>
+          </div>
+
+          <div class="keys" role="group" aria-label="Keys"></div>
+
+
+        </div>
+      </article>
+    </template>
+
+    <dialog id="create-dialog" class="modal">
+      <form id="create-form" method="dialog" autocomplete="off">
+        <h2>New session</h2>
+        <div class="field-row">
+          <label>
+            Agent
+            <select name="agent">
+              <option value="claude">Claude Code</option>
+              <option value="codex">Codex</option>
+            </select>
+          </label>
+          <label>
+            Name
+            <input name="name" placeholder="claude-feature-x" required maxlength="80" pattern="[A-Za-z0-9_.:\-]+" title="Letters, digits, . _ : -" />
+          </label>
+        </div>
+        <label>
+          Directory
+          <input name="directory" value="/home/ubuntu/apps" required maxlength="500" />
+        </label>
+        <label>
+          Provider route
+          <select name="route"><option value="direct">Loading routes</option></select>
+          <small id="route-hint" class="hint"></small>
+        </label>
+        <p id="create-error" class="form-error" role="alert" hidden></p>
+        <div class="modal-actions">
+          <button type="button" data-close>Cancel</button>
+          <button type="submit" class="primary">Create session</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="token-dialog" class="modal">
+      <form id="token-form" method="dialog" autocomplete="off">
+        <h2>Write token</h2>
+        <p id="token-message" class="hint"></p>
+        <label>
+          Token
+          <input id="token-input" name="token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" />
+        </label>
+        <div class="modal-actions">
+          <button type="button" id="token-clear">Clear saved token</button>
+          <button type="button" data-close>Cancel</button>
+          <button type="submit" class="primary">Save token</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="help-dialog" class="modal">
+      <h2>Keyboard</h2>
+      <dl class="help">
+        <dt><kbd>j</kbd> <kbd>k</kbd></dt><dd>Move between sessions</dd>
+        <dt><kbd>o</kbd> or <kbd>Enter</kbd></dt><dd>Open or close the current session</dd>
+        <dt><kbd>/</kbd></dt><dd>Reply to the current session</dd>
+        <dt><kbd>Enter</kbd> in the reply box</dt><dd>Send and press Enter in the pane</dd>
+        <dt><kbd>Shift</kbd>+<kbd>Enter</kbd></dt><dd>New line in the reply box</dd>
+        <dt><kbd>Ctrl</kbd>+<kbd>Enter</kbd></dt><dd>Type without pressing Enter</dd>
+        <dt><kbd>r</kbd></dt><dd>Refresh now</dd>
+        <dt><kbd>n</kbd></dt><dd>New session</dd>
+        <dt><kbd>Esc</kbd></dt><dd>Leave the reply box, close menus</dd>
+      </dl>
+      <div class="modal-actions">
+        <button type="button" data-close class="primary">Close</button>
+      </div>
+    </dialog>
+
+    <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+
+    <script src="./app.js" type="module"></script>
   </body>
 </html>
