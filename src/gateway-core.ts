@@ -77,6 +77,46 @@ const HOP_BY_HOP = new Set([
 const AUTH_HEADERS = new Set(["authorization", "x-api-key", "api-key"]);
 const LIMIT_HEADER = /^(anthropic-ratelimit-|x-ratelimit-|x-codex-|retry-after$|x-should-retry$)/i;
 const MAX_TAP_BYTES = 4 * 1024 * 1024;
+/**
+ * Anthropic-compatible third-party upstreams (Bedrock Mantle, Foundry) answer
+ * 400 and name the `anthropic-beta` flags they do not know. Extract them so
+ * the gateway can retry without those flags and remember them per route.
+ */
+export function rejectedBetaValues(text: string): string[] {
+  const match = /Unexpected value\(s\) (.+?) for the `anthropic-beta` header/.exec(text);
+  if (!match) return [];
+  return match[1].split(",").map((value) => value.trim().replace(/^`|`$/g, "")).filter(Boolean);
+}
+
+/**
+ * Codex replays its reasoning items with `encrypted_content` that only the
+ * backend which produced them can decrypt. After a session moves between
+ * backends (ChatGPT, Azure, Bedrock) the new upstream answers 400 naming the
+ * first foreign item. Strip reasoning items (all of them, or the given ids)
+ * from a Responses request body so the turn can proceed without them.
+ */
+export function stripReasoningItems(body: Buffer, ids: Set<string> | "all"): { body: Buffer; removed: string[] } {
+  let json: { input?: unknown };
+  try {
+    json = JSON.parse(body.toString("utf8")) as { input?: unknown };
+  } catch {
+    return { body, removed: [] };
+  }
+  if (!json || !Array.isArray(json.input)) return { body, removed: [] };
+  const removed: string[] = [];
+  json.input = (json.input as { type?: string; id?: string; encrypted_content?: string }[]).filter((item) => {
+    const foreign = item?.type === "reasoning" && typeof item.encrypted_content === "string" && (ids === "all" || (item.id !== undefined && ids.has(item.id)));
+    if (foreign) removed.push(item.id ?? "");
+    return !foreign;
+  });
+  if (!removed.length) return { body, removed };
+  return { body: Buffer.from(JSON.stringify(json)), removed };
+}
+
+export function isForeignReasoningError(text: string): boolean {
+  return /encrypted content for item \S+ could not be verified/i.test(text);
+}
+
 const DUMMY_TOKENS = new Set(["devy-gateway"]);
 
 export class Gateway {
@@ -315,15 +355,50 @@ export class Gateway {
 
   // ── Admin mutations ──────────────────────────────────────────────────────
 
-  updateSettings(patch: { autoSwitch?: boolean; defaults?: Partial<Record<Lane, string | null>> }): void {
-    if (typeof patch.autoSwitch === "boolean") this.state.autoSwitch = patch.autoSwitch;
+  updateSettings(patch: { autoSwitch?: boolean; defaults?: Partial<Record<Lane, string | null>> }): {
+    appliedSessions: string[]; blockedSessions: { session: string; reason: string }[];
+  } {
+    // Validate the complete request first: a bad second lane must not leave the
+    // first lane or the failover setting partially changed.
     for (const lane of ["claude", "codex"] as Lane[]) {
       const id = patch.defaults?.[lane];
       if (id === undefined) continue;
       if (id !== null && this.byId.get(id)?.lane !== lane) throw new Error(`unknown ${lane} route: ${id}`);
+      if (id !== null && !this.isAvailable(this.byId.get(id)!)) {
+        throw new Error(this.byId.get(id)!.unavailableReason ?? `route ${id} is disabled`);
+      }
+    }
+    const appliedSessions: string[] = [];
+    const blockedSessions: { session: string; reason: string }[] = [];
+    if (typeof patch.autoSwitch === "boolean") this.state.autoSwitch = patch.autoSwitch;
+    for (const lane of ["claude", "codex"] as Lane[]) {
+      const id = patch.defaults?.[lane];
+      if (id === undefined) continue;
+      const previousDefault = this.state.defaults[lane];
+      const target = id ? this.byId.get(id) : undefined;
+      for (const [session, assignment] of Object.entries(this.state.assignments)) {
+        if (session.startsWith(PROBE_PREFIX)) continue;
+        const assignedLane = assignment.lane ?? (assignment.route ? this.byId.get(assignment.route)?.lane : undefined);
+        if (assignedLane !== lane) continue;
+        const reason = assignment.mode === "pinned" ? "Pinned to a provider"
+          : target?.auth.type === "passthrough" && target.account !== assignment.account
+            ? "This account requires reconnecting the session" : null;
+        if (reason) {
+          // A follower with an incompatible login must keep its old route.
+          // Losing it would silently send the next request to a fallback API.
+          if (assignment.route === null) assignment.route = previousDefault;
+          blockedSessions.push({ session, reason });
+          continue;
+        }
+        assignment.route = null;
+        assignment.lane = lane;
+        assignment.updatedAt = Date.now();
+        appliedSessions.push(session);
+      }
       this.state.defaults[lane] = id;
     }
     this.markDirty();
+    return { appliedSessions, blockedSessions };
   }
 
   updateRoute(routeId: string, patch: { enabled?: boolean; position?: number }): void {
@@ -339,14 +414,16 @@ export class Gateway {
     this.markDirty();
   }
 
-  assign(session: string, patch: { route?: string | null; mode?: SessionMode; account?: string | null }): SessionAssignment {
+  assign(session: string, patch: { route?: string | null; mode?: SessionMode; account?: string | null; lane?: Lane }): SessionAssignment {
     if (!/^[A-Za-z0-9_.:-]{1,80}$/.test(session)) throw new Error("invalid session name");
     if (patch.mode !== undefined && patch.mode !== "auto" && patch.mode !== "pinned") throw new Error("invalid session mode");
+    if (patch.lane !== undefined && patch.lane !== "claude" && patch.lane !== "codex") throw new Error("invalid session lane");
     const current = this.state.assignments[session] ?? { route: null, mode: "auto" as SessionMode, account: null, updatedAt: 0 };
     if (patch.route !== undefined && patch.route !== null && !this.byId.has(patch.route)) throw new Error(`unknown route: ${patch.route}`);
     const previousRoute = current.route ? this.byId.get(current.route) : undefined;
     const target = patch.route ? this.byId.get(patch.route) : undefined;
-    const lane = current.lane ?? previousRoute?.lane ?? target?.lane;
+    const lane = current.lane ?? previousRoute?.lane ?? patch.lane ?? target?.lane;
+    if (patch.lane && lane && patch.lane !== lane) throw new Error("cannot switch between Claude and Codex protocols");
     if (target && lane && target.lane !== lane) throw new Error("cannot switch between Claude and Codex protocols");
     if (target && !this.isAvailable(target)) throw new Error(target.unavailableReason ?? "route is disabled");
     if (this.state.assignments[session] && patch.account !== undefined && patch.account !== current.account) {
@@ -417,7 +494,11 @@ export class Gateway {
 
   private async proxy(req: IncomingMessage, res: ServerResponse, lane: Lane, session: string, suffix: string): Promise<void> {
     const started = Date.now();
-    const body = await readBody(req);
+    const clientBody = await readBody(req);
+    // Reasoning items this session already had rejected by a new backend are
+    // dropped up front so a switched session does not fail once per turn.
+    const knownForeign = this.foreignReasoning.get(session);
+    const body = lane === "codex" && knownForeign?.size ? stripReasoningItems(clientBody, knownForeign).body : clientBody;
     const clientAuth = String(req.headers.authorization || "");
     const clientHasLogin = /^Bearer\s+\S+/i.test(clientAuth) && !DUMMY_TOKENS.has(clientAuth.replace(/^Bearer\s+/i, "").trim());
     const model = extractModel(body);
@@ -444,20 +525,48 @@ export class Gateway {
     for (const route of chain) {
       attempts += 1;
       const upstreamModel = model ? mapModel(route, model) : null;
-      const outBody = model && upstreamModel && upstreamModel !== model ? rewriteModel(body, upstreamModel) : body;
+      let outBody = model && upstreamModel && upstreamModel !== model ? rewriteModel(body, upstreamModel) : body;
       const headers = this.upstreamHeaders(req, route);
-      if (outBody !== body) headers.set("content-length", String(outBody.length));
+      if (outBody !== clientBody) headers.set("content-length", String(outBody.length));
       const target = `${route.upstream}${suffix}`;
 
+      const send = () => this.fetchImpl(target, {
+        method: req.method,
+        headers,
+        body: req.method === "GET" || req.method === "HEAD" ? undefined : new Uint8Array(outBody),
+        signal: abort.signal,
+        redirect: "manual"
+      });
       let upstream: Response;
       try {
-        upstream = await this.fetchImpl(target, {
-          method: req.method,
-          headers,
-          body: req.method === "GET" || req.method === "HEAD" ? undefined : new Uint8Array(outBody),
-          signal: abort.signal,
-          redirect: "manual"
-        });
+        upstream = await send();
+        // A key-based Anthropic-compatible upstream that rejects unknown beta
+        // flags names them in a 400. Drop them for this route and resend once.
+        if (upstream.status === 400 && route.auth.type !== "passthrough" && headers.has("anthropic-beta")) {
+          const rejected = rejectedBetaValues(await upstream.clone().text().catch(() => ""));
+          if (rejected.length) {
+            const learned = this.rejectedBetas.get(route.id) ?? new Set<string>();
+            for (const value of rejected) learned.add(value);
+            this.rejectedBetas.set(route.id, learned);
+            const kept = headers.get("anthropic-beta")!.split(",").map((value) => value.trim()).filter((value) => value && !learned.has(value));
+            if (kept.length) headers.set("anthropic-beta", kept.join(","));
+            else headers.delete("anthropic-beta");
+            upstream = await send();
+          }
+        }
+        // The new backend cannot decrypt reasoning items another backend
+        // produced. Drop them, remember their ids for this session, resend once.
+        if (upstream.status === 400 && lane === "codex" && isForeignReasoningError(await upstream.clone().text().catch(() => ""))) {
+          const stripped = stripReasoningItems(outBody, "all");
+          if (stripped.removed.length) {
+            const remembered = this.foreignReasoning.get(session) ?? new Set<string>();
+            for (const id of stripped.removed) if (id) remembered.add(id);
+            this.foreignReasoning.set(session, remembered);
+            outBody = stripped.body;
+            headers.set("content-length", String(outBody.length));
+            upstream = await send();
+          }
+        }
       } catch (error) {
         if (abort.signal.aborted) return;
         lastError = `${route.id}: ${(error as Error).message}`;
@@ -466,7 +575,9 @@ export class Gateway {
       }
 
       this.noteLimits(route, upstream.headers);
-      const retryable = upstream.status === 429 || upstream.status === 529 || upstream.status >= 500 || (route.auth.type !== "passthrough" && (upstream.status === 401 || upstream.status === 403));
+      // 404 from a key-based route means it does not serve this model (Bedrock
+      // Mantle lists only the Claude models enabled in the account); move on.
+      const retryable = upstream.status === 429 || upstream.status === 529 || upstream.status >= 500 || (route.auth.type !== "passthrough" && (upstream.status === 401 || upstream.status === 403 || upstream.status === 404));
       if (retryable && attempts < chain.length) {
         const text = await upstream.text().catch(() => "");
         lastStatus = upstream.status;
@@ -515,6 +626,11 @@ export class Gateway {
     json(res, lastStatus === 429 ? 429 : 502, { error: { type: "gateway_error", message: `Devy gateway: all ${lane} routes failed. ${lastError}` } });
   }
 
+  /** anthropic-beta flags each key-based route has rejected with a 400, learned at runtime. */
+  private readonly rejectedBetas = new Map<string, Set<string>>();
+  /** Reasoning item ids per session that an upstream refused to decrypt (produced by another backend). */
+  private readonly foreignReasoning = new Map<string, Set<string>>();
+
   private upstreamHeaders(req: IncomingMessage, route: RouteDef): Headers {
     const headers = new Headers();
     for (const [key, value] of Object.entries(req.headers)) {
@@ -541,12 +657,14 @@ export class Gateway {
         headers.set("api-key", this.env[route.auth.env] ?? "");
         break;
     }
-    // The OAuth beta flag only means something to Anthropic's own endpoint.
+    // The OAuth beta flag only means something to Anthropic's own endpoint, and
+    // flags this upstream already rejected (see rejectedBetas) are dropped too.
     if (route.auth.type !== "passthrough") {
       headers.delete("chatgpt-account-id");
       const beta = headers.get("anthropic-beta");
       if (beta) {
-        const kept = beta.split(",").map((value) => value.trim()).filter((value) => value && !value.startsWith("oauth-"));
+        const rejected = this.rejectedBetas.get(route.id);
+        const kept = beta.split(",").map((value) => value.trim()).filter((value) => value && !value.startsWith("oauth-") && !rejected?.has(value));
         if (kept.length) headers.set("anthropic-beta", kept.join(","));
         else headers.delete("anthropic-beta");
       }
@@ -609,8 +727,8 @@ export class Gateway {
       if (req.method === "GET" && parts[1] === "state") return json(res, 200, this.view());
       const body = req.method === "GET" ? {} : parseJson(await readBody(req));
       if (req.method === "PUT" && parts[1] === "settings") {
-        this.updateSettings(body as Parameters<Gateway["updateSettings"]>[0]);
-        return json(res, 200, { ok: true, autoSwitch: this.state.autoSwitch, defaults: this.state.defaults });
+        const result = this.updateSettings(body as Parameters<Gateway["updateSettings"]>[0]);
+        return json(res, 200, { ok: true, autoSwitch: this.state.autoSwitch, defaults: this.state.defaults, ...result });
       }
       if (parts[1] === "routes" && parts[2]) {
         if (req.method === "PUT" && !parts[3]) {

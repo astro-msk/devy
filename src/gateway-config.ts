@@ -144,8 +144,8 @@ export function routeCatalog(env: NodeJS.ProcessEnv = process.env): RouteDef[] {
       lane: "claude",
       label: "Claude on Bedrock",
       provider: `Amazon Bedrock Mantle (${region})`,
-      description: "Bedrock's native Anthropic endpoint, authenticated with a Bedrock API key. Pay per token on AWS.",
-      upstream: mantle,
+      description: "Bedrock Mantle's Anthropic-compatible endpoint (/anthropic/v1/messages), authenticated with a Bedrock API key. Pay per token on AWS. Only the Claude models enabled in the Bedrock account and region are served.",
+      upstream: `${mantle}/anthropic`,
       auth: { type: "bearer", env: "AWS_BEARER_TOKEN_BEDROCK" },
       modelPrefix: "anthropic.",
       stripDateSuffix: true,
@@ -216,10 +216,12 @@ export function routeCatalog(env: NodeJS.ProcessEnv = process.env): RouteDef[] {
       lane: "codex",
       label: "Codex on Bedrock",
       provider: `Amazon Bedrock Mantle (${region})`,
-      description: `OpenAI models on Bedrock. Every model is served as ${env.BEDROCK_CODEX_MODEL || "openai.gpt-5.6-sol"}.`,
+      // Mantle only accepts the Responses API (which Codex speaks) for the
+      // gpt-oss models; the frontier openai.gpt-5.x ids reject /v1/responses.
+      description: `OpenAI models on Bedrock. Every model is served as ${env.BEDROCK_CODEX_MODEL || "openai.gpt-oss-120b"}.`,
       upstream: `${mantle}/v1`,
       auth: { type: "bearer", env: "AWS_BEARER_TOKEN_BEDROCK" },
-      modelMap: { "*": env.BEDROCK_CODEX_MODEL || "openai.gpt-5.6-sol" },
+      modelMap: { "*": env.BEDROCK_CODEX_MODEL || "openai.gpt-oss-120b" },
       defaultEnabled: true,
       unavailableReason: missing("AWS_BEARER_TOKEN_BEDROCK")
     },

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { mapModel, reconcileState, routeCatalog, type RouteDef } from "./gateway-config.js";
-import { createGatewayServer, extractUsage, Gateway } from "./gateway-core.js";
+import { createGatewayServer, extractUsage, Gateway, rejectedBetaValues, stripReasoningItems } from "./gateway-core.js";
 
 // A fake upstream that records requests and answers with whatever the test
 // queues up, so failover and header handling can be asserted precisely.
@@ -175,6 +175,63 @@ test("HEAD /api/hello is answered locally", async () => {
   }
 });
 
+test("changing a default moves existing automatic sessions on their next request", async () => {
+  const t = await harness((u) => [keyRoute("a", u, "KEY_A"), keyRoute("b", u, "KEY_B")]);
+  try {
+    t.gateway.assign("existing", { route: "a", mode: "auto" });
+    t.gateway.assign("pinned", { route: "a", mode: "pinned" });
+    t.gateway.assign("_probe--a", { route: "a", mode: "pinned" });
+    const request = () => fetch(`${t.base}/claude/existing/v1/messages`, { method: "POST", body: "{}" });
+    await request();
+    assert.equal(t.up.seen.at(-1)?.headers["x-api-key"], "secret-a");
+    const response = await fetch(`${t.base}/_gw/settings`, { method: "PUT", body: JSON.stringify({ defaults: { claude: "b" } }) });
+    const result = await response.json();
+    assert.equal(response.status, 200);
+    await request();
+    assert.equal(t.up.seen.at(-1)?.headers["x-api-key"], "secret-b");
+    assert.equal(t.gateway.assignment("existing")?.route, null, "continues following later default changes");
+    assert.deepEqual(result.appliedSessions, ["existing"]);
+    assert.deepEqual(result.blockedSessions, [{ session: "pinned", reason: "Pinned to a provider" }]);
+    assert.equal(t.gateway.assignment("pinned")?.route, "a");
+    assert.equal(t.gateway.assignment("_probe--a")?.route, "a");
+  } finally { await t.close(); }
+});
+
+test("default changes report account mismatches and retain the working route", async () => {
+  const t = await harness((u) => [
+    keyRoute("key", u, "KEY_A"),
+    keyRoute("personal", u, "KEY_A", { auth: { type: "passthrough" }, account: "claude-personal" }),
+    keyRoute("business", u, "KEY_A", { auth: { type: "passthrough" }, account: "claude-business" }),
+    keyRoute("codex", u, "KEY_A", { lane: "codex" })
+  ]);
+  try {
+    t.gateway.updateSettings({ defaults: { claude: "personal" } });
+    t.gateway.assign("following", { route: "personal", account: "claude-personal" });
+    t.gateway.assign("following", { route: null });
+    t.gateway.assign("key-only", { route: "key" });
+    t.gateway.assign("matching", { route: "business", account: "claude-business" });
+    t.gateway.assign("other-lane", { route: "codex" });
+    const result = t.gateway.updateSettings({ defaults: { claude: "business" } });
+    assert.deepEqual(result.appliedSessions, ["matching"]);
+    assert.deepEqual(result.blockedSessions.map((s) => s.session), ["following", "key-only"]);
+    assert.equal(t.gateway.assignment("following")?.route, "personal");
+    assert.equal(t.gateway.assignment("key-only")?.route, "key");
+    assert.equal(t.gateway.assignment("other-lane")?.route, "codex");
+    assert.equal(t.gateway.candidates("claude", "following", true).chain[0].id, "personal");
+  } finally { await t.close(); }
+});
+
+test("invalid default changes are atomic and reject disabled routes", async () => {
+  const t = await harness((u) => [keyRoute("a", u, "KEY_A"), keyRoute("b", u, "KEY_B", { defaultEnabled: false })]);
+  try {
+    const before = structuredClone(t.gateway.state);
+    assert.throws(() => t.gateway.updateSettings({ autoSwitch: false, defaults: { claude: "a", codex: "missing" } }), /unknown codex route/);
+    assert.deepEqual(t.gateway.state, before);
+    assert.throws(() => t.gateway.updateSettings({ defaults: { claude: "b" } }), /disabled/);
+    assert.deepEqual(t.gateway.state, before);
+  } finally { await t.close(); }
+});
+
 test("live routing preserves the launch account and protocol when following defaults", async () => {
   const t = await harness((u) => [
     keyRoute("a", u, "KEY_A"),
@@ -249,4 +306,71 @@ test("mapModel and catalog availability follow the environment", () => {
   assert.ok(!state.order.claude.includes("ghost"));
   assert.equal(state.enabled["claude-key"], true);
   assert.equal(state.enabled.ghost, undefined);
+});
+
+test("learns the anthropic-beta flags a key-based upstream rejects and resends without them", async () => {
+  const t = await harness((u) => [keyRoute("mantle", u, "KEY_A")]);
+  try {
+    const message = "Unexpected value(s) `advisor-tool-2026-03-01`, `extended-cache-ttl-2025-04-11` for the `anthropic-beta` header. Please consult our documentation.";
+    assert.deepEqual(rejectedBetaValues(JSON.stringify({ error: { message } })), ["advisor-tool-2026-03-01", "extended-cache-ttl-2025-04-11"]);
+    assert.deepEqual(rejectedBetaValues("{\"error\":{\"message\":\"model not found\"}}"), []);
+    t.up.replies.push({ status: 400, body: JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }) });
+    const headers = { "content-type": "application/json", "anthropic-beta": "advisor-tool-2026-03-01,context-1m-2025-08-07,extended-cache-ttl-2025-04-11" };
+    const body = JSON.stringify({ model: "claude-haiku-4-5", messages: [] });
+    const first = await fetch(`${t.base}/claude/s1/v1/messages`, { method: "POST", headers, body });
+    assert.equal(first.status, 200, "the request is resent once without the rejected flags");
+    assert.equal(t.up.seen.length, 2);
+    assert.equal(t.up.seen[0].headers["anthropic-beta"], "advisor-tool-2026-03-01,context-1m-2025-08-07,extended-cache-ttl-2025-04-11");
+    assert.equal(t.up.seen[1].headers["anthropic-beta"], "context-1m-2025-08-07");
+    const second = await fetch(`${t.base}/claude/s1/v1/messages`, { method: "POST", headers, body });
+    assert.equal(second.status, 200);
+    assert.equal(t.up.seen.length, 3, "later requests skip the rejected flags without a round trip");
+    assert.equal(t.up.seen[2].headers["anthropic-beta"], "context-1m-2025-08-07");
+    assert.equal(t.gateway.log.length, 2);
+    assert.equal(t.gateway.counters("mantle").errors, 0);
+  } finally { await t.close(); }
+});
+
+test("a key-based route that does not serve the model (404) fails over to the next route", async () => {
+  const t = await harness((u) => [keyRoute("a", u, "KEY_A"), keyRoute("b", u, "KEY_B")]);
+  try {
+    t.up.replies.push({ status: 404, body: JSON.stringify({ error: { message: "model not found" } }) });
+    const res = await fetch(`${t.base}/claude/s1/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "claude-opus-5", messages: [] }) });
+    assert.equal(res.status, 200);
+    assert.equal(t.up.seen.length, 2);
+    assert.equal(t.up.seen[0].headers["x-api-key"], "secret-a");
+    assert.equal(t.up.seen[1].headers["x-api-key"], "secret-b");
+    assert.equal(t.gateway.log.at(-1)?.route, "b");
+    assert.equal(t.gateway.log.at(-1)?.attempts, 2);
+  } finally { await t.close(); }
+});
+
+test("a Codex session moved to another backend drops the reasoning items that backend cannot decrypt", async () => {
+  const t = await harness((u) => [keyRoute("azure", u, "KEY_A", { lane: "codex", auth: { type: "api-key", env: "KEY_A" } })]);
+  try {
+    const input = [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+      { type: "reasoning", id: "rs_old_1", summary: [], encrypted_content: "from-chatgpt" },
+      { type: "function_call", id: "fc_1", call_id: "c1", name: "shell", arguments: "{}" },
+      { type: "reasoning", id: "rs_old_2", summary: [], encrypted_content: "from-chatgpt-too" }
+    ];
+    const unit = stripReasoningItems(Buffer.from(JSON.stringify({ model: "gpt-6-astra", input })), "all");
+    assert.deepEqual(unit.removed, ["rs_old_1", "rs_old_2"]);
+    assert.equal(JSON.parse(unit.body.toString()).input.length, 2);
+    assert.equal(stripReasoningItems(Buffer.from("not json"), "all").removed.length, 0);
+    const failure = { error: { message: "The encrypted content for item rs_old_1 could not be verified. Reason: Encrypted content could not be decrypted or parsed." } };
+    t.up.replies.push({ status: 400, body: JSON.stringify(failure) });
+    const post = (items: unknown[]) => fetch(`${t.base}/codex/s1/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "gpt-6-astra", store: false, input: items }) });
+    const first = await post(input);
+    assert.equal(first.status, 200, "resent once without the foreign reasoning items");
+    assert.equal(t.up.seen.length, 2);
+    const resent = JSON.parse(t.up.seen[1].body);
+    assert.deepEqual(resent.input.map((item: { type: string }) => item.type), ["message", "function_call"]);
+    assert.equal(Number(t.up.seen[1].headers["content-length"]), t.up.seen[1].body.length, "content-length follows the rewritten body");
+    const next = [...input, { type: "reasoning", id: "rs_new_1", summary: [], encrypted_content: "from-azure" }];
+    const second = await post(next);
+    assert.equal(second.status, 200);
+    assert.equal(t.up.seen.length, 3, "known foreign items are dropped before sending, so no failed round trip");
+    assert.deepEqual(JSON.parse(t.up.seen[2].body).input.map((item: { id?: string; type: string }) => item.id ?? item.type), ["message", "fc_1", "rs_new_1"]);
+  } finally { await t.close(); }
 });
