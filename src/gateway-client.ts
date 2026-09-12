@@ -6,6 +6,7 @@ import { execFile } from "node:child_process";
 import { access, copyFile, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import type { Gateway } from "./gateway-core.js";
 import {
   accountCatalog,
   findAccount,
@@ -30,21 +31,32 @@ export type LaunchSpec = { env: Record<string, string>; args: string[]; account:
 
 // ── Admin API ─────────────────────────────────────────────────────────────
 
-export async function gatewayRequest<T = unknown>(method: string, apiPath: string, body?: unknown): Promise<T> {
+export async function gatewayRequest<T = unknown>(method: string, apiPath: string, body?: unknown, timeoutMs = 8000): Promise<T> {
   const response = await fetch(`${gatewayUrl()}/_gw${apiPath}`, {
     method,
     headers: body === undefined ? {} : { "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(8000)
+    signal: AbortSignal.timeout(timeoutMs)
   });
   const payload = (await response.json().catch(() => ({}))) as { error?: string } & T;
   if (!response.ok) throw new Error(payload.error || `gateway HTTP ${response.status}`);
   return payload;
 }
 
-export async function gatewayState(): Promise<{ up: boolean; error?: string; state: Awaited<ReturnType<typeof gatewayRequest>> | null }> {
+export async function gatewayState(): Promise<{ up: boolean; error?: string; state: ReturnType<Gateway["view"]> | null }> {
   try {
-    return { up: true, state: await gatewayRequest("GET", "/state") };
+    const [state, accounts] = await Promise.all([
+      gatewayRequest<ReturnType<Gateway["view"]>>("GET", "/state"), accountStatuses()
+    ]);
+    for (const route of state.routes) {
+      if (!route.account) continue;
+      const account = accounts.find((item) => item.id === route.account);
+      if (!account?.signedIn) {
+        route.available = false;
+        route.unavailableReason = account?.detail || "account is not signed in";
+      }
+    }
+    return { up: true, state };
   } catch (error) {
     return { up: false, error: (error as Error).message, state: null };
   }
@@ -56,15 +68,16 @@ export async function accountStatuses(): Promise<AccountStatus[]> {
   return Promise.all(accountCatalog().map((account) => accountStatus(account)));
 }
 
-async function accountStatus(account: AccountDef): Promise<AccountStatus> {
+export async function accountStatus(account: AccountDef): Promise<AccountStatus> {
   const base = { ...account, signedIn: false, detail: null as string | null, expiresAt: null as number | null, loginSession: loginSessionName(account.id) };
   try {
     if (account.lane === "claude") {
-      const raw = JSON.parse(await readFile(path.join(account.dir, ".credentials.json"), "utf8")) as { claudeAiOauth?: { expiresAt?: number; subscriptionType?: string; refreshTokenExpiresAt?: number } };
+      const raw = JSON.parse(await readFile(path.join(account.dir, ".credentials.json"), "utf8")) as { claudeAiOauth?: { accessToken?: string; refreshToken?: string; expiresAt?: number; subscriptionType?: string; refreshTokenExpiresAt?: number } };
       const oauth = raw.claudeAiOauth;
-      if (!oauth) return { ...base, detail: "no claude.ai login" };
+      if (!oauth?.accessToken) return { ...base, detail: "no claude.ai login" };
       const refreshDeadline = oauth.refreshTokenExpiresAt ?? null;
-      const alive = !refreshDeadline || refreshDeadline > Date.now();
+      const alive = !oauth.expiresAt || oauth.expiresAt > Date.now() ||
+        Boolean(oauth.refreshToken && (!refreshDeadline || refreshDeadline > Date.now()));
       return {
         ...base,
         signedIn: alive,
@@ -74,7 +87,7 @@ async function accountStatus(account: AccountDef): Promise<AccountStatus> {
     }
     const raw = JSON.parse(await readFile(path.join(account.dir, "auth.json"), "utf8")) as { auth_mode?: string; OPENAI_API_KEY?: string | null; tokens?: { access_token?: string; account_id?: string } };
     if (raw.tokens?.access_token) return { ...base, signedIn: true, detail: `ChatGPT login${raw.tokens.account_id ? ` · account ${raw.tokens.account_id.slice(0, 8)}…` : ""}` };
-    if (raw.OPENAI_API_KEY) return { ...base, signedIn: true, detail: "API key login (not a ChatGPT subscription)" };
+    if (raw.OPENAI_API_KEY) return { ...base, signedIn: false, detail: "API key login; use the OpenAI API key route" };
     return { ...base, detail: "auth.json has no tokens" };
   } catch {
     return { ...base, detail: "not signed in" };
@@ -127,6 +140,7 @@ export async function prepareAccountDir(account: AccountDef): Promise<void> {
  */
 export async function launchSpec(lane: Lane, session: string, route: RouteDef, accountId?: string | null): Promise<LaunchSpec> {
   const base = `${gatewayUrl()}/${lane}/${session}`;
+  if (route.lane !== lane) throw new Error(`route ${route.id} does not support ${lane}`);
   let account: AccountDef | null = null;
   if (route.auth.type === "passthrough") {
     account = findAccount(route.account);
@@ -137,24 +151,32 @@ export async function launchSpec(lane: Lane, session: string, route: RouteDef, a
     const fallback = findAccount(lane === "claude" ? "claude-personal" : "chatgpt-personal")!;
     account = (await accountStatus(fallback)).signedIn ? fallback : null;
   }
-  if (account) await prepareAccountDir(account);
+  if (account) {
+    if (account.lane !== lane) throw new Error("login account does not match the client");
+    if (!(await accountStatus(account)).signedIn) throw new Error(`${account.label} is not signed in`);
+    await prepareAccountDir(account);
+  }
 
   if (lane === "claude") {
     // Blank ANTHROPIC_API_KEY so a key in the launching shell's environment
     // can't shadow the account login (the gateway injects real keys itself).
-    const env: Record<string, string> = { ANTHROPIC_BASE_URL: base, ANTHROPIC_API_KEY: "" };
+    const env: Record<string, string> = {
+      ANTHROPIC_BASE_URL: base, ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "",
+      CLAUDE_CODE_USE_BEDROCK: "0", CLAUDE_CODE_USE_VERTEX: "0", CLAUDE_CODE_USE_FOUNDRY: "0"
+    };
     if (account && !account.isDefaultHome) env.CLAUDE_CONFIG_DIR = account.dir;
     if (!account) env.ANTHROPIC_AUTH_TOKEN = "devy-gateway";
     return { env, args: [], account: account?.id ?? null };
   }
 
-  const env: Record<string, string> = {};
+  const env: Record<string, string> = { OPENAI_API_KEY: "" };
   if (account && !account.isDefaultHome) env.CODEX_HOME = account.dir;
   const args = [
     "-c", "model_provider=devy",
     "-c", 'model_providers.devy.name="Devy gateway"',
     "-c", `model_providers.devy.base_url="${base}"`,
-    "-c", 'model_providers.devy.wire_api="responses"'
+    "-c", 'model_providers.devy.wire_api="responses"',
+    "-c", 'model_providers.devy.supports_websockets=false'
   ];
   if (account) {
     args.push("-c", "model_providers.devy.requires_openai_auth=true");
@@ -221,7 +243,7 @@ export type ProbeResult = { ok: boolean; via: "gateway" | "client"; ms: number; 
  */
 export async function probeRoute(route: RouteDef): Promise<ProbeResult> {
   const started = Date.now();
-  const direct = await gatewayRequest<{ ok: boolean; needsClient?: boolean; status?: number; ms?: number; model?: string; error?: string }>("POST", `/routes/${route.id}/probe`);
+  const direct = await gatewayRequest<{ ok: boolean; needsClient?: boolean; status?: number; ms?: number; model?: string; error?: string }>("POST", `/routes/${route.id}/probe`, undefined, 55_000);
   if (!direct.needsClient) {
     return { ok: direct.ok, via: "gateway", ms: direct.ms ?? Date.now() - started, status: direct.status, model: direct.model, output: direct.ok ? "OK" : "", error: direct.error };
   }
@@ -236,22 +258,28 @@ export async function probeRoute(route: RouteDef): Promise<ProbeResult> {
   for (const key of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "AZURE_OPENAI_API_KEY", "AWS_BEARER_TOKEN_BEDROCK"]) {
     if (!(key in spec.env)) delete env[key];
   }
-  const prompt = "Reply with exactly: PROBE_OK";
+  const prompt = "Do not use any tools. Reply with exactly: PROBE_OK";
   // No `--bare` for claude: bare mode skips the claude.ai login, which is the
   // very thing a passthrough probe exercises. stdin is closed so neither client
   // waits on a pipe.
-  const opts = { env, timeout: 120_000, maxBuffer: 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] as const };
+  const opts = { env, timeout: 120_000, maxBuffer: 1024 * 1024 };
   try {
-    const { stdout, stderr } =
+    const invocation =
       route.lane === "claude"
-        ? await execFileAsync("claude", ["-p", prompt, "--max-turns", "1", "--no-session-persistence", "--model", "haiku", ...spec.args], opts)
-        : await execFileAsync("codex", ["exec", "--skip-git-repo-check", "-C", "/tmp", ...spec.args, prompt], opts);
-    const output = `${stdout}\n${stderr}`.trim();
-    const ok = /PROBE_OK/.test(output);
-    return { ok, via: "client", ms: Date.now() - started, output: tail(output), error: ok ? undefined : "client did not answer PROBE_OK" };
+        ? execFileAsync("claude", ["-p", prompt, "--max-turns", "1", "--no-session-persistence", "--model", "haiku", ...spec.args], opts)
+        : execFileAsync("codex", ["exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check", "-C", "/tmp", "-c", "mcp_servers={}", "-c", "plugins={}", "-c", "features.apps=false", ...spec.args, prompt], opts);
+    // execFile does not forward a stdio option to spawn. Explicitly end the
+    // pipe or Codex waits for extra stdin until the probe times out.
+    invocation.child.stdin?.end();
+    const { stdout, stderr } = await invocation;
+    const ok = /\bPROBE_OK\b/.test(stdout);
+    return { ok, via: "client", ms: Date.now() - started, output: tail(ok ? stdout : `${stdout}\n${stderr}`), error: ok ? undefined : "client did not answer PROBE_OK" };
   } catch (error) {
     const err = error as { stdout?: string; stderr?: string; message: string };
-    return { ok: false, via: "client", ms: Date.now() - started, output: tail(`${err.stdout ?? ""}\n${err.stderr ?? ""}`), error: err.message.split("\n")[0] };
+    const detail = err.stderr?.split("\n").filter((line) => line.startsWith("ERROR:")).at(-1);
+    return { ok: false, via: "client", ms: Date.now() - started, output: tail(`${err.stdout ?? ""}\n${err.stderr ?? ""}`), error: detail || err.message.split("\n")[0] };
+  } finally {
+    await gatewayRequest("DELETE", `/sessions/${session}`).catch(() => {});
   }
 }
 

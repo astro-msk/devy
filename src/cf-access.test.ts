@@ -49,6 +49,12 @@ test("rejects an expired JWT", async () => {
   if (!result.ok) assert.match(result.reason, /exp/i);
 });
 
+test("rejects an otherwise valid JWT without an expiration", async () => {
+  const result = await verifier.verify(await fake.sign({ email: EMAIL }, { expiresIn: null }));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.reason, /exp/i);
+});
+
 test("rejects a JWT that is not yet valid", async () => {
   const result = await verifier.verify(await fake.sign({ email: EMAIL }, { notBefore: "10m" }));
   assert.equal(result.ok, false);
@@ -86,12 +92,22 @@ test("refetches the JWKS when it meets an unknown kid", async () => {
 test("fails closed when the environment is incomplete", () => {
   assert.deepEqual(accessConfigFromEnv({}), {
     config: null,
-    missing: ["CF_ACCESS_TEAM_DOMAIN", "CF_ACCESS_AUD", "CF_ACCESS_ALLOWED_EMAILS"]
+    missing: ["CF_ACCESS_TEAM_DOMAIN", "CF_ACCESS_AUD"]
   });
   assert.deepEqual(
     accessConfigFromEnv({ CF_ACCESS_TEAM_DOMAIN: "team.cloudflareaccess.com", CF_ACCESS_AUD: "x" }).missing,
-    ["CF_ACCESS_ALLOWED_EMAILS"]
+    []
   );
+});
+
+test("Cloudflare policy controls access when no additional email list is set", async () => {
+  const unrestricted = new AccessVerifier({ ...verifier.config, allowedEmails: [] });
+  assert.equal((await unrestricted.verify(await fake.sign({ email: "cloudflare-approved@example.com" }))).ok, true);
+  // Service identities need not have a human email claim.
+  assert.equal((await unrestricted.verify(await fake.sign({ sub: "approved-service" }))).ok, true);
+  assert.equal((await unrestricted.verify(await fake.sign({ email: EMAIL }, { audience: "other-app" }))).ok, false);
+  assert.equal((await unrestricted.verify(await fake.sign({ email: EMAIL }, { expiresIn: null }))).ok, false);
+  assert.equal((await unrestricted.verify(await fake.sign({ email: EMAIL }, { foreignKey: true }))).ok, false);
 });
 
 test("parses the environment into a config", () => {

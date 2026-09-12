@@ -14,7 +14,7 @@ export interface AccessConfig {
   teamDomain: string;
   /** Application Audience (AUD) tag of the Access application. */
   audience: string;
-  /** Lower-cased allow list; the JWT `email` claim must be one of these. */
+  /** Optional additional restriction; empty trusts the Cloudflare Access policy. */
   allowedEmails: string[];
   /** Where the signing keys live. Defaults to Cloudflare's certs endpoint; tests point it at a local server. */
   jwksUrl?: string;
@@ -24,6 +24,8 @@ export interface AccessConfig {
 
 export interface AccessIdentity {
   email: string;
+  /** Stable bucket for human and service identities; email may be absent. */
+  subject: string;
   /** Unix milliseconds when the JWT expires. */
   expiresAt: number;
 }
@@ -48,7 +50,6 @@ export function accessConfigFromEnv(env: NodeJS.ProcessEnv = process.env): {
   const missing: string[] = [];
   if (!teamDomain) missing.push("CF_ACCESS_TEAM_DOMAIN");
   if (!audience) missing.push("CF_ACCESS_AUD");
-  if (!allowedEmails.length) missing.push("CF_ACCESS_ALLOWED_EMAILS");
   if (missing.length) return { config: null, missing };
 
   return { config: { teamDomain, audience, allowedEmails }, missing };
@@ -110,7 +111,10 @@ export class AccessVerifier {
       const verified = await jwtVerify(token, this.keys, {
         issuer: this.issuer,
         audience: this.config.audience,
-        algorithms: ["RS256"]
+        algorithms: ["RS256"],
+        // jose checks expiration when present; require it so a signed token
+        // without exp cannot grant an unbounded Access session.
+        requiredClaims: ["exp"]
       });
       payload = verified.payload;
     } catch (error) {
@@ -118,11 +122,16 @@ export class AccessVerifier {
     }
 
     const email = typeof payload.email === "string" ? payload.email.trim().toLowerCase() : "";
-    if (!email) return { ok: false, reason: "access token has no email claim" };
-    if (!this.config.allowedEmails.includes(email)) return { ok: false, reason: "email not allowed" };
+    if (this.config.allowedEmails.length) {
+      if (!email) return { ok: false, reason: "access token has no email claim" };
+      if (!this.config.allowedEmails.includes(email)) return { ok: false, reason: "email not allowed" };
+    }
 
-    const exp = typeof payload.exp === "number" ? payload.exp * 1000 : Date.now() + TOKEN_CACHE_TTL_MS;
-    const identity: AccessIdentity = { email, expiresAt: Math.min(exp, Date.now() + TOKEN_CACHE_TTL_MS) };
+    const exp = (payload.exp as number) * 1000;
+    const subject = typeof payload.sub === "string" && payload.sub
+      ? payload.sub
+      : email || (typeof payload.common_name === "string" && payload.common_name) || "application";
+    const identity: AccessIdentity = { email, subject, expiresAt: Math.min(exp, Date.now() + TOKEN_CACHE_TTL_MS) };
     this.remember(token, identity);
     return { ok: true, identity };
   }

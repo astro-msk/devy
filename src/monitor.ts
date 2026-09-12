@@ -1,3 +1,4 @@
+import { envValue } from "./config.js";
 import type { EventAgent, EventInput } from "./db.js";
 import type { EventType } from "./db.js";
 import { createEvent } from "./db.js";
@@ -25,22 +26,44 @@ export type AgentStatus = {
   git: GitStatus;
 };
 
-type WaitingTracker = {
+export type WaitingTracker = {
   waitingSince: number | null;
   alerted: boolean;
   waitingKey: string | null;
 };
 
+/** The slice of a session the alert state machine looks at. */
+export type WaitingObservation = Pick<ManagedSession, "name" | "agent" | "state" | "lastOutput" | "paneCurrentPath">;
+
+const POLL_INTERVAL_MS = 7000;
+const HOOK_SUPPRESS_MS = 120000;
+
 let cachedStatuses: AgentStatus[] = [];
 let cachedSessions: ManagedSession[] = [];
 let pollTimer: NodeJS.Timeout | null = null;
+let pollInFlight = false;
 const trackers = new Map<string, WaitingTracker>();
 const hookSuppressUntil = new Map<string, number>();
 
 export function startMonitor(): void {
   if (pollTimer) return;
-  void pollAgents();
-  pollTimer = setInterval(() => void pollAgents(), 7000);
+  void safePoll();
+  pollTimer = setInterval(() => void safePoll(), POLL_INTERVAL_MS);
+}
+
+// A poll that throws (SQLite busy, tmux wedged) used to surface as an
+// unhandled rejection, which Node turns into a process exit. A slow poll used
+// to overlap with the next tick; now a tick is skipped instead.
+async function safePoll(): Promise<void> {
+  if (pollInFlight) return;
+  pollInFlight = true;
+  try {
+    await pollAgents();
+  } catch (error) {
+    console.warn(`[Devy] monitor poll failed: ${(error as Error).message}`);
+  } finally {
+    pollInFlight = false;
+  }
 }
 
 export async function getAgentStatuses(): Promise<AgentStatus[]> {
@@ -60,8 +83,8 @@ export async function getObservedSessions(): Promise<ManagedSession[]> {
 }
 
 export function sessionForAgent(agent: string): string {
-  if (agent === "claude") return process.env.CLAUDE_TMUX_SESSION || "claude";
-  if (agent === "codex") return process.env.CODEX_TMUX_SESSION || "codex";
+  if (agent === "claude") return envValue("CLAUDE_TMUX_SESSION");
+  if (agent === "codex") return envValue("CODEX_TMUX_SESSION");
   return "system";
 }
 
@@ -69,9 +92,14 @@ export async function recordEvent(input: EventInput): Promise<void> {
   const event = createEvent(input);
   const session = sessionForEvent(input, event);
   if (isAgentName(input.agent) && isAlertType(input.type)) {
-    hookSuppressUntil.set(session, Date.now() + 120000);
+    hookSuppressUntil.set(session, Date.now() + HOOK_SUPPRESS_MS);
   }
-  await sendSlackAlert(event, session, repoPathForEvent(input, event));
+  // The event is durable once createEvent returns; Slack delivery is a side
+  // effect that must not hold up the hook script's 2-second curl or the
+  // monitor loop, and its failure must not reject the caller.
+  sendSlackAlert(event, session, repoPathForEvent(input, event)).catch((error) => {
+    console.warn(`[Devy] Slack alert for event ${event.id} failed: ${(error as Error).message}`);
+  });
 }
 
 export async function sendAgentInput(agent: AgentName, text: string, submit: boolean, source: string): Promise<void> {
@@ -100,11 +128,46 @@ async function pollAgents(): Promise<void> {
   const sessions = await listManagedSessions();
   cachedSessions = sessions;
   cachedStatuses = agentStatusesFromSessions(sessions);
-  const now = Date.now();
-  const activeSessionNames = new Set(sessions.map((s) => s.name));
+
+  const alerts = detectWaitingAlerts(sessions, {
+    trackers,
+    suppressUntil: hookSuppressUntil,
+    now: Date.now(),
+    waitMs: waitAlertMs()
+  });
+  for (const alert of alerts) {
+    // One bad event (say, SQLite briefly locked) must not skip the rest.
+    try {
+      await recordEvent(alert);
+    } catch (error) {
+      console.warn(`[Devy] could not record waiting alert for ${alert.session}: ${(error as Error).message}`);
+    }
+  }
+}
+
+export type WaitingAlertState = {
+  /** Per-session debounce state; mutated in place. */
+  trackers: Map<string, WaitingTracker>;
+  /** Sessions whose own hook already alerted; the monitor stays quiet until the timestamp. */
+  suppressUntil: Map<string, number>;
+  now: number;
+  waitMs: number;
+};
+
+/**
+ * The alert state machine, separated from tmux and SQLite so it can be driven
+ * with fake sessions and a fake clock. A session that has shown the same
+ * prompt (same reason + same screen hash) for longer than `waitMs` yields one
+ * approval_required event; a changed prompt re-arms it, leaving the waiting
+ * state resets it, and a vanished session drops its tracker.
+ */
+export function detectWaitingAlerts(sessions: WaitingObservation[], state: WaitingAlertState): EventInput[] {
+  const { trackers: trackerMap, suppressUntil, now, waitMs } = state;
+  const alerts: EventInput[] = [];
+  const activeSessionNames = new Set(sessions.map((session) => session.name));
 
   for (const session of sessions) {
-    const tracker = trackerForSession(session.name);
+    const tracker = trackerFor(trackerMap, session.name);
     if (session.state !== "waiting_for_input") {
       tracker.waitingSince = null;
       tracker.alerted = false;
@@ -121,46 +184,45 @@ async function pollAgents(): Promise<void> {
     }
 
     tracker.waitingSince ??= now;
-    if (!tracker.alerted && now - tracker.waitingSince > waitAlertMs()) {
-      if ((hookSuppressUntil.get(session.name) || 0) > now) {
-        tracker.alerted = true;
-        continue;
-      }
+    if (tracker.alerted || now - tracker.waitingSince <= waitMs) continue;
 
-      tracker.alerted = true;
-      const agentValue: EventAgent = isAgentName(session.agent) ? session.agent : "system";
-      const event: EventInput = {
-        agent: agentValue,
-        type: "approval_required",
-        message: buildWaitingMessage(session.name, session.agent, reason, session.lastOutput),
+    tracker.alerted = true;
+    if ((suppressUntil.get(session.name) || 0) > now) continue;
+
+    const agentValue: EventAgent = isAgentName(session.agent) ? session.agent : "system";
+    alerts.push({
+      agent: agentValue,
+      type: "approval_required",
+      message: buildWaitingMessage(session.name, session.agent, reason, session.lastOutput),
+      session: session.name,
+      repoPath: session.paneCurrentPath,
+      raw: {
+        source: "tmux-monitor",
         session: session.name,
+        tmuxAgent: session.agent,
         repoPath: session.paneCurrentPath,
-        raw: {
-          source: "tmux-monitor",
-          session: session.name,
-          tmuxAgent: session.agent,
-          repoPath: session.paneCurrentPath,
-          detectedAt: new Date(now).toISOString(),
-          reason,
-          outputPreview: session.lastOutput.slice(-1000)
-        }
-      };
-      await recordEvent(event);
-    }
+        detectedAt: new Date(now).toISOString(),
+        reason,
+        outputPreview: session.lastOutput.slice(-1000)
+      }
+    });
   }
 
-  for (const sessionName of trackers.keys()) {
-    if (!activeSessionNames.has(sessionName)) trackers.delete(sessionName);
+  for (const sessionName of trackerMap.keys()) {
+    if (!activeSessionNames.has(sessionName)) trackerMap.delete(sessionName);
   }
+  for (const [sessionName, until] of suppressUntil) {
+    if (until <= now) suppressUntil.delete(sessionName);
+  }
+  return alerts;
 }
 
 function repoPath(): string {
-  return process.env.REPO_PATH || process.cwd();
+  return envValue("REPO_PATH") || process.cwd();
 }
 
 function waitAlertMs(): number {
-  const seconds = Number(process.env.AGENT_WAIT_ALERT_SECONDS || 30);
-  return Math.max(10, seconds) * 1000;
+  return envValue("AGENT_WAIT_ALERT_SECONDS") * 1000;
 }
 
 function agentLabel(agent: AgentName): string {
@@ -200,11 +262,11 @@ function isAgentSession(session: ManagedSession): session is ManagedSession & { 
   return isAgentName(session.agent);
 }
 
-function trackerForSession(session: string): WaitingTracker {
-  const existing = trackers.get(session);
+function trackerFor(trackerMap: Map<string, WaitingTracker>, session: string): WaitingTracker {
+  const existing = trackerMap.get(session);
   if (existing) return existing;
   const tracker = { waitingSince: null, alerted: false, waitingKey: null };
-  trackers.set(session, tracker);
+  trackerMap.set(session, tracker);
   return tracker;
 }
 

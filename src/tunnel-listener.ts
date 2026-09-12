@@ -20,7 +20,9 @@ export function startTunnelListener(app: Express, port: number, label: string): 
   } else {
     console.log(
       `[${label}] Cloudflare Access enforced on tunnel listener: team ${verifier.config.teamDomain}, ` +
-        `${verifier.config.allowedEmails.length} allowed email(s)`
+        (verifier.config.allowedEmails.length
+          ? `${verifier.config.allowedEmails.length} locally allowed email(s)`
+          : "identity policy managed by Cloudflare")
     );
   }
 

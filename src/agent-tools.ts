@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { envValue } from "./config.js";
 import { listManagedSessions, invalidateSessionCache } from "./sessions.js";
 import { sendInputToSession } from "./tmux.js";
 
@@ -9,13 +10,13 @@ import { sendInputToSession } from "./tmux.js";
 // runs as the `ubuntu` user, behind Tailscale + write-auth, and only when
 // ENABLE_AGENT_TOOLS is not "false".
 export function agentToolsEnabled(): boolean {
-  return process.env.ENABLE_AGENT_TOOLS !== "false";
+  return envValue("ENABLE_AGENT_TOOLS");
 }
 
 const HOME = process.env.HOME || "/home/ubuntu";
-const BASH_TIMEOUT_MS = Number(process.env.AGENT_BASH_TIMEOUT_SECONDS || 180) * 1000;
-const OUTPUT_CAP = 60_000; // characters returned to the model per tool call
-const FILE_READ_CAP = 200_000;
+const bashTimeoutMs = (): number => envValue("AGENT_BASH_TIMEOUT_SECONDS") * 1000;
+export const OUTPUT_CAP = 60_000; // characters returned to the model per tool call
+export const FILE_READ_CAP = 200_000; // bytes of a file handed to the model
 
 // Guardrails against the handful of commands that can brick the host in one
 // keystroke. Not a security boundary (the agent has a shell) — just a seatbelt
@@ -59,7 +60,7 @@ const bash: ToolDef = {
     const command = String(input.command || "").trim();
     if (!command) return { content: "empty command", isError: true };
     // Full yolo: AGENT_UNRESTRICTED_BASH=true drops even the brick-guard.
-    const guarded = process.env.AGENT_UNRESTRICTED_BASH !== "true";
+    const guarded = !envValue("AGENT_UNRESTRICTED_BASH");
     if (guarded && BLOCKED_BASH.some((pattern) => pattern.test(command))) {
       return {
         content: `Refused: "${command}" matches a destructive-command guard. Rephrase to be more specific if you really mean it.`,
@@ -80,18 +81,40 @@ const readFileTool: ToolDef = {
     required: ["path"]
   },
   async run(input) {
-    const target = expandHome(String(input.path || ""));
+    const rawPath = String(input.path || "").trim();
+    if (!rawPath) return { content: "read failed: path is required", isError: true };
+    const target = expandHome(rawPath);
     try {
       const info = await stat(target);
       if (info.isDirectory()) return { content: `${target} is a directory. Use bash 'ls' instead.`, isError: true };
-      const raw = await readFile(target, "utf8");
-      const clipped = raw.length > FILE_READ_CAP ? `${raw.slice(0, FILE_READ_CAP)}\n… [truncated ${raw.length - FILE_READ_CAP} chars]` : raw;
-      return { content: clipped, isError: false };
+      // Read only what will be returned. A multi-GB log or a database file
+      // used to be slurped whole into memory before being sliced.
+      const handle = await open(target, "r");
+      try {
+        const buffer = Buffer.alloc(Math.min(info.size, FILE_READ_CAP));
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+        const head = buffer.subarray(0, bytesRead);
+        if (looksBinary(head)) {
+          return { content: `${target} looks like a binary file (${info.size} bytes). Use bash (file, xxd, strings) to inspect it.`, isError: true };
+        }
+        const text = head.toString("utf8");
+        const clipped = info.size > bytesRead ? `${text}\n… [truncated ${info.size - bytesRead} bytes]` : text;
+        return { content: clipped, isError: false };
+      } finally {
+        await handle.close();
+      }
     } catch (error) {
       return { content: `read failed: ${(error as Error).message}`, isError: true };
     }
   }
 };
+
+// NUL bytes never appear in text encodings the model can use; sampling the
+// first few KB is how `file` and `git` make the same call.
+function looksBinary(bytes: Buffer): boolean {
+  const sample = bytes.subarray(0, 8192);
+  return sample.includes(0);
+}
 
 const writeFileTool: ToolDef = {
   name: "write_file",
@@ -105,7 +128,9 @@ const writeFileTool: ToolDef = {
     required: ["path", "content"]
   },
   async run(input) {
-    const target = expandHome(String(input.path || ""));
+    const rawPath = String(input.path || "").trim();
+    if (!rawPath) return { content: "write failed: path is required", isError: true };
+    const target = expandHome(rawPath);
     const body = String(input.content ?? "");
     try {
       await mkdir(path.dirname(target), { recursive: true });
@@ -209,40 +234,71 @@ export async function runTool(name: string, input: unknown, ctx: ToolContext): P
   }
 }
 
-function runShell(command: string, cwd: string, ctx: ToolContext): Promise<ToolResult> {
+export function runShell(command: string, cwd: string, ctx: ToolContext): Promise<ToolResult> {
   return new Promise((resolve) => {
-    const child = spawn("bash", ["-lc", command], { cwd, env: process.env });
+    // stdin is /dev/null: the model cannot answer prompts, so a command that
+    // reads stdin (`cat`, `git commit` without -m) must fail fast rather than
+    // sit until the timeout. `detached` gives the command its own process
+    // group so a timeout can kill pipelines and backgrounded children too,
+    // not just the outer bash.
+    const child = spawn("bash", ["-lc", command], { cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"], detached: true });
     let out = "";
     let capped = false;
+    let killed = false;
+    // The browser gets the same cap as the model: streaming 100 MB of `yes`
+    // to a phone helps nobody, so once the cap is hit nothing more is read.
     const append = (chunk: Buffer) => {
-      const text = chunk.toString();
-      ctx.onOutput?.(text);
       if (capped) return;
-      out += text;
-      if (out.length > OUTPUT_CAP) {
-        out = `${out.slice(0, OUTPUT_CAP)}\n… [output truncated]`;
-        capped = true;
+      const text = chunk.toString();
+      const room = OUTPUT_CAP - out.length;
+      if (text.length <= room) {
+        out += text;
+        ctx.onOutput?.(text);
+        return;
       }
+      const tail = `${text.slice(0, room)}\n… [output truncated]`;
+      out += tail;
+      ctx.onOutput?.(tail);
+      capped = true;
     };
     child.stdout.on("data", append);
     child.stderr.on("data", append);
 
+    const timeoutMs = bashTimeoutMs();
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      out += `\n… [killed after ${Math.round(BASH_TIMEOUT_MS / 1000)}s timeout]`;
-    }, BASH_TIMEOUT_MS);
+      killed = true;
+      killProcessGroup(child.pid);
+    }, timeoutMs);
 
     child.on("error", (error) => {
       clearTimeout(timer);
       resolve({ content: `spawn failed: ${error.message}`, isError: true });
     });
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
       clearTimeout(timer);
       const trimmed = out.trim() || "(no output)";
-      const suffix = code === 0 ? "" : `\n[exit ${code}]`;
-      resolve({ content: trimmed + suffix, isError: code !== 0 });
+      const suffix = killed
+        ? `\n… [killed after ${Math.round(timeoutMs / 1000)}s timeout]`
+        : code === 0
+          ? ""
+          : `\n[exit ${code ?? `signal ${signal}`}]`;
+      resolve({ content: trimmed + suffix, isError: killed || code !== 0 });
     });
   });
+}
+
+function killProcessGroup(pid: number | undefined): void {
+  if (!pid) return;
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    // The group may already be gone; make sure the leader is, too.
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // already exited
+    }
+  }
 }
 
 function expandHome(target: string): string {

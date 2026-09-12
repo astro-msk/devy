@@ -78,7 +78,7 @@ export function invalidateSessionCache(): void {
  * (env prefix + agent + args) when the session should go through the gateway;
  * omitted, the bare agent runs with its own default provider.
  */
-export async function createManagedSession(name: string, agent: "claude" | "codex", directory: string, launch?: string): Promise<void> {
+export async function createManagedSession(name: string, agent: "claude" | "codex", directory: string, launch?: string, options: { closeOnSuccess?: boolean } = {}): Promise<void> {
   const resolved = safeProjectDirectory(directory);
 
   const exists = await tmux(["list-sessions", "-F", "#{session_name}"]);
@@ -89,12 +89,19 @@ export async function createManagedSession(name: string, agent: "claude" | "code
   // `new-session -d -s NAME -c DIR agent` dies instantly if the agent binary is
   // missing or exits, so the session vanishes and the UI shows nothing. Wrap it
   // so the error stays on screen and the session drops to a shell instead.
-  const command = `${launch || agent} || echo "[Devy] ${agent} exited with status $?"; exec bash -l`;
+  const command = managedSessionCommand(agent, launch, options.closeOnSuccess);
   const result = await tmux(["new-session", "-d", "-s", name, "-c", resolved, "bash", "-lc", command]);
   if (result.code !== 0) {
     throw new Error(result.stderr || `failed to create ${agent} session`);
   }
   invalidateSessionCache();
+}
+
+export function managedSessionCommand(agent: "claude" | "codex", launch?: string, closeOnSuccess = false): string {
+  if (closeOnSuccess) {
+    return `${launch || agent} && exit 0; echo "[Devy] ${agent} exited with status $?"; exec bash -l`;
+  }
+  return `${launch || agent} || echo "[Devy] ${agent} exited with status $?"; exec bash -l`;
 }
 
 export async function activePaneDirectory(sessionName: string): Promise<string> {

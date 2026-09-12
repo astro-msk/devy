@@ -3,6 +3,8 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { App } from "@slack/bolt";
 import type { ActionsBlock, KnownBlock } from "@slack/types";
+import { envList, envValue } from "./config.js";
+import { redactSecrets } from "./redact.js";
 import {
   acknowledgeSlackTriage,
   appendSlackChatTurn,
@@ -136,15 +138,15 @@ let ackTimer: NodeJS.Timeout | undefined;
 let chatQueue: Promise<void> = Promise.resolve();
 
 export function registerDevySlackAgent(app: App): void {
-  const ownerId = process.env.SLACK_WATCH_USER_ID?.trim();
-  const reportChannelId = process.env.SLACK_TRIAGE_CHANNEL_ID?.trim() || process.env.SLACK_CHANNEL_ID?.trim();
-  const watchedNames = splitList(process.env.SLACK_WATCH_NAMES);
-  const observedChannels = new Set(splitList(process.env.SLACK_OBSERVE_CHANNELS));
+  const ownerId = envValue("SLACK_WATCH_USER_ID");
+  const reportChannelId = triageReportChannel();
+  const watchedNames = envList("SLACK_WATCH_NAMES");
+  const observedChannels = new Set(envList("SLACK_OBSERVE_CHANNELS"));
   if (!ownerId || !reportChannelId) {
     console.log("Devy Slack triage disabled: SLACK_WATCH_USER_ID or Slack report channel is missing");
     return;
   }
-  if (!process.env.SLACK_USER_TOKEN?.trim()) {
+  if (!envValue("SLACK_USER_TOKEN")) {
     console.log("Devy workspace-wide Slack context disabled: SLACK_USER_TOKEN is missing");
   }
   if (observedChannels.size) {
@@ -249,7 +251,11 @@ export function isAcknowledgement(text: string): boolean {
 }
 
 export function ackReminderMinutes(): number {
-  return Math.min(Math.max(Number(process.env.SLACK_ACK_REMINDER_MINUTES || 30), 1), 1440);
+  return envValue("SLACK_ACK_REMINDER_MINUTES");
+}
+
+function triageReportChannel(): string | undefined {
+  return envValue("SLACK_TRIAGE_CHANNEL_ID") || envValue("SLACK_CHANNEL_ID");
 }
 
 async function confirmAcknowledgement(client: SlackClient, triage: SlackTriageRecord): Promise<void> {
@@ -367,13 +373,6 @@ async function removeBuildWorkspace(triage: SlackTriageRecord): Promise<void> {
   if (branch) {
     await runCommand("git", ["branch", "-D", branch], repository.path, "", 30_000).catch(() => undefined);
   }
-}
-
-export function splitList(value: string | undefined): string[] {
-  return (value || "")
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
 }
 
 export function isWatchedReference(
@@ -500,7 +499,7 @@ export async function askDevy(history: SlackChatTurn[]): Promise<string> {
     "-C", commonRepositoryRoot(repositories),
     "-"
   ];
-  const model = process.env.SLACK_CODEX_MODEL?.trim();
+  const model = envValue("SLACK_CODEX_MODEL");
   if (model) args.splice(1, 0, "--model", model);
   await runCommand("codex", args, process.cwd(), prompt, chatTimeoutMs());
   const reply = redactSensitive((await readFile(outputPath, "utf8")).trim());
@@ -509,11 +508,11 @@ export async function askDevy(history: SlackChatTurn[]): Promise<string> {
 }
 
 function chatHistoryTurns(): number {
-  return Math.min(Math.max(Number(process.env.SLACK_CHAT_HISTORY_TURNS || 20), 2), 60);
+  return envValue("SLACK_CHAT_HISTORY_TURNS");
 }
 
 function chatTimeoutMs(): number {
-  return Math.min(Math.max(Number(process.env.SLACK_CHAT_TIMEOUT_SECONDS || 300), 30), 1800) * 1000;
+  return envValue("SLACK_CHAT_TIMEOUT_SECONDS") * 1000;
 }
 
 function queueTriage(client: SlackClient, message: SlackObservedMessage): void {
@@ -532,11 +531,11 @@ function queueTriage(client: SlackClient, message: SlackObservedMessage): void {
 }
 
 async function processTriage(client: SlackClient, triage: SlackTriageRecord): Promise<void> {
-  const reportChannelId = process.env.SLACK_TRIAGE_CHANNEL_ID?.trim() || process.env.SLACK_CHANNEL_ID?.trim();
+  const reportChannelId = triageReportChannel();
   if (!reportChannelId) return;
 
   try {
-    const readToken = process.env.SLACK_USER_TOKEN?.trim();
+    const readToken = envValue("SLACK_USER_TOKEN");
     const context = await fetchSlackContext(client, triage, readToken);
     const permalinkResponse = await client.chat.getPermalink({
       ...(readToken ? { token: readToken } : {}),
@@ -584,7 +583,7 @@ async function fetchSlackContext(
   triage: SlackTriageRecord,
   readToken?: string
 ): Promise<SlackObservedMessage[]> {
-  const limit = Math.min(Math.max(Number(process.env.SLACK_CONTEXT_MESSAGES || 12), 3), 30);
+  const limit = envValue("SLACK_CONTEXT_MESSAGES");
   const auth = readToken ? { token: readToken } : {};
   let response: SlackMessageResponse;
   if (triage.sourceThreadTs) {
@@ -652,7 +651,7 @@ export async function analyzeSlackReference(
     "-C", commonRepositoryRoot(repositories),
     "-"
   ];
-  const model = process.env.SLACK_CODEX_MODEL?.trim();
+  const model = envValue("SLACK_CODEX_MODEL");
   if (model) args.splice(1, 0, "--model", model);
   await runCommand("codex", args, process.cwd(), prompt, triageTimeoutMs());
   const parsed = JSON.parse(await readFile(outputPath, "utf8")) as unknown;
@@ -667,7 +666,7 @@ async function handleApproval(
   actorId: string,
   command: "approve" | "reject"
 ): Promise<void> {
-  if (actorId !== process.env.SLACK_WATCH_USER_ID?.trim()) return;
+  if (actorId !== envValue("SLACK_WATCH_USER_ID")) return;
   if (!triage.reportChannelId || !triage.reportThreadTs) return;
 
   if (command === "reject") {
@@ -907,7 +906,7 @@ function validateTriageAnalysis(value: unknown): TriageAnalysis {
 }
 
 function configuredRepositories(): Repository[] {
-  const configured = process.env.DEVY_REPOSITORIES?.trim();
+  const configured = envValue("DEVY_REPOSITORIES");
   if (!configured) {
     return [
       { name: "Pilot", path: "/home/ubuntu/work/repos/Pilot" },
@@ -989,7 +988,11 @@ function runCommand(
   let stderr = "";
   const cap = 200_000;
   const timer = setTimeout(() => {
-    if (child.pid) process.kill(-child.pid, "SIGTERM");
+    try {
+      if (child.pid) process.kill(-child.pid, "SIGTERM");
+    } catch {
+      // The child can exit before its close event reaches this process.
+    }
     reject(new Error(`${program} timed out after ${Math.round(timeoutMs / 1000)} seconds`));
   }, timeoutMs);
   child.stdout.on("data", (chunk: Buffer) => {
@@ -1036,10 +1039,7 @@ function escapeSlack(value: string): string {
 }
  
 function redactSensitive(value: string): string {
-  return value
-    .replace(/(token|secret|password|api[_-]?key|authorization)\s*[:=]\s*["']?[\w./+=:-]+/gi, "$1=[redacted]")
-    .replace(/\b(?:xox[baprs]-|gh[opsu]_)[A-Za-z0-9_-]+\b/g, "[redacted]")
-    .replace(/\b[A-Za-z0-9_-]{40,}\b/g, "[redacted]");
+  return redactSecrets(value, { minTokenLength: 40 });
 }
 
 function cleanForPrompt(value: string): string {
@@ -1072,9 +1072,9 @@ function prTitle(analysis: TriageAnalysis): string {
 }
 
 function triageTimeoutMs(): number {
-  return Math.min(Math.max(Number(process.env.SLACK_TRIAGE_TIMEOUT_SECONDS || 600), 60), 1800) * 1000;
+  return envValue("SLACK_TRIAGE_TIMEOUT_SECONDS") * 1000;
 }
 
 function buildTimeoutMs(): number {
-  return Math.min(Math.max(Number(process.env.SLACK_BUILD_TIMEOUT_SECONDS || 3600), 300), 7200) * 1000;
+  return envValue("SLACK_BUILD_TIMEOUT_SECONDS") * 1000;
 }

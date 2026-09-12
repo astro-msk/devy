@@ -40,6 +40,7 @@ export type LogEntry = {
   route: string;
   attempts: number;
   status: number;
+  outcome?: "completed" | "failed" | "cancelled";
   ms: number;
   model: string | null;
   upstreamModel: string | null;
@@ -179,7 +180,7 @@ export class Gateway {
           skipped.push(`${route.id}: session has no login token`);
           return false;
         }
-        if (assignment?.account && route.account !== assignment.account) {
+        if (assignment && route.account !== assignment.account) {
           skipped.push(`${route.id}: session was launched with ${assignment.account}`);
           return false;
         }
@@ -339,14 +340,28 @@ export class Gateway {
   }
 
   assign(session: string, patch: { route?: string | null; mode?: SessionMode; account?: string | null }): SessionAssignment {
+    if (!/^[A-Za-z0-9_.:-]{1,80}$/.test(session)) throw new Error("invalid session name");
+    if (patch.mode !== undefined && patch.mode !== "auto" && patch.mode !== "pinned") throw new Error("invalid session mode");
     const current = this.state.assignments[session] ?? { route: null, mode: "auto" as SessionMode, account: null, updatedAt: 0 };
     if (patch.route !== undefined && patch.route !== null && !this.byId.has(patch.route)) throw new Error(`unknown route: ${patch.route}`);
+    const previousRoute = current.route ? this.byId.get(current.route) : undefined;
+    const target = patch.route ? this.byId.get(patch.route) : undefined;
+    const lane = current.lane ?? previousRoute?.lane ?? target?.lane;
+    if (target && lane && target.lane !== lane) throw new Error("cannot switch between Claude and Codex protocols");
+    if (target && !this.isAvailable(target)) throw new Error(target.unavailableReason ?? "route is disabled");
+    if (this.state.assignments[session] && patch.account !== undefined && patch.account !== current.account) {
+      throw new Error("a running session keeps its launch account; start a new session to change accounts");
+    }
     const next: SessionAssignment = {
+      lane,
       route: patch.route === undefined ? current.route : patch.route,
       mode: patch.mode ?? current.mode,
       account: patch.account === undefined ? current.account : patch.account,
       updatedAt: Date.now()
     };
+    if (target?.auth.type === "passthrough" && target.account !== next.account) {
+      throw new Error("this subscription uses a different login; start a new session with that account");
+    }
     this.state.assignments[session] = next;
     this.markDirty();
     return next;
@@ -418,7 +433,10 @@ export class Gateway {
     }
 
     const abort = new AbortController();
-    req.on("close", () => abort.abort());
+    req.once("aborted", () => abort.abort());
+    res.once("close", () => {
+      if (!res.writableEnded) abort.abort();
+    });
     let attempts = 0;
     let lastError = "";
     let lastStatus = 502;
@@ -466,7 +484,8 @@ export class Gateway {
       }
       const tap = await this.relay(upstream, res, abort);
       const usage = tap.usage;
-      if (upstream.status < 400) {
+      if (tap.error && !tap.cancelled) this.noteFailure(route, 0, null, tap.error);
+      if (upstream.status < 400 && !tap.error) {
         this.noteOk(route);
         counters.inputTokens += usage.inputTokens ?? 0;
         counters.outputTokens += usage.outputTokens ?? 0;
@@ -479,13 +498,14 @@ export class Gateway {
         route: route.id,
         attempts,
         status: upstream.status,
+        outcome: tap.cancelled ? "cancelled" : tap.error || upstream.status >= 400 ? "failed" : "completed",
         ms: Date.now() - started,
         model,
         upstreamModel,
         inputTokens: usage.inputTokens,
         outputTokens: usage.outputTokens,
         cacheReadTokens: usage.cacheReadTokens,
-        error: upstream.status >= 400 ? tap.text.slice(0, 300) : attempts > 1 ? `after failover: ${lastError}` : null
+        error: tap.error ?? (upstream.status >= 400 ? tap.text.slice(0, 300) : attempts > 1 ? `after failover: ${lastError}` : null)
       });
       this.markDirty();
       return;
@@ -523,6 +543,7 @@ export class Gateway {
     }
     // The OAuth beta flag only means something to Anthropic's own endpoint.
     if (route.auth.type !== "passthrough") {
+      headers.delete("chatgpt-account-id");
       const beta = headers.get("anthropic-beta");
       if (beta) {
         const kept = beta.split(",").map((value) => value.trim()).filter((value) => value && !value.startsWith("oauth-"));
@@ -534,7 +555,7 @@ export class Gateway {
   }
 
   /** Stream the upstream response to the client while scanning it for token usage. */
-  private async relay(upstream: Response, res: ServerResponse, abort: AbortController): Promise<{ usage: Usage; text: string }> {
+  private async relay(upstream: Response, res: ServerResponse, abort: AbortController): Promise<{ usage: Usage; text: string; error?: string; cancelled?: boolean }> {
     const outHeaders: Record<string, string> = {};
     upstream.headers.forEach((value, key) => {
       if (HOP_BY_HOP.has(key) || key === "content-encoding" || key === "content-length") return;
@@ -552,16 +573,27 @@ export class Gateway {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          if (!res.write(value)) await new Promise<void>((resolve) => res.once("drain", resolve));
+          if (abort.signal.aborted || res.destroyed) throw new Error("client disconnected");
+          if (!res.write(value)) await new Promise<void>((resolve, reject) => {
+            const cleanup = () => { res.off("drain", onDrain); res.off("close", onClose); };
+            const onDrain = () => { cleanup(); resolve(); };
+            const onClose = () => { cleanup(); reject(new Error("client disconnected")); };
+            res.once("drain", onDrain);
+            res.once("close", onClose);
+          });
           if (tapped < MAX_TAP_BYTES) {
-            chunks.push(Buffer.from(value));
-            tapped += value.length;
+            const part = value.subarray(0, MAX_TAP_BYTES - tapped);
+            chunks.push(Buffer.from(part));
+            tapped += part.length;
           }
         }
       } catch (error) {
+        const cancelled = abort.signal.aborted;
         if (!abort.signal.aborted) res.destroy(error as Error);
         const text = Buffer.concat(chunks).toString("utf8");
-        return { usage: extractUsage(text), text };
+        return { usage: extractUsage(text), text, error: (error as Error).message, cancelled };
+      } finally {
+        await reader.cancel().catch(() => {});
       }
     }
     res.end();

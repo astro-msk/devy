@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
 import { agentToolsEnabled, runTool, toolDefinitions } from "./agent-tools.js";
+import { envValue } from "./config.js";
 
 // Neutral, provider-independent transcript pieces. These are what we persist and
 // what the browser renders, so switching model providers never changes storage
@@ -17,16 +18,16 @@ const MAX_TOOL_ITERATIONS = 40;
 export type Provider = "openai" | "anthropic";
 
 export function providerName(): Provider {
-  const explicit = (process.env.AGENT_OPS_AI_PROVIDER || "").toLowerCase();
-  if (explicit === "openai" || explicit === "anthropic") return explicit;
+  const explicit = envValue("AGENT_OPS_AI_PROVIDER");
+  if (explicit) return explicit;
   // Default to OpenAI when its key is present (the Anthropic key is out of
   // credits on this box); otherwise fall back to Anthropic.
-  if (process.env.OPENAI_API_KEY) return "openai";
+  if (envValue("OPENAI_API_KEY")) return "openai";
   return "anthropic";
 }
 
 export function aiConfigured(): boolean {
-  return providerName() === "openai" ? Boolean(process.env.OPENAI_API_KEY) : Boolean(process.env.ANTHROPIC_API_KEY);
+  return providerName() === "openai" ? Boolean(envValue("OPENAI_API_KEY")) : Boolean(envValue("ANTHROPIC_API_KEY"));
 }
 
 export function activeModel(): string {
@@ -34,11 +35,11 @@ export function activeModel(): string {
 }
 
 function openaiModel(): string {
-  return process.env.OPENAI_MODEL || "gpt-5.6";
+  return envValue("OPENAI_MODEL");
 }
 
 function anthropicModel(): string {
-  return process.env.AGENT_OPS_AI_MODEL || "claude-opus-4-8";
+  return envValue("AGENT_OPS_AI_MODEL");
 }
 
 // Runs the agentic tool loop against the active provider, emitting SSE events
@@ -54,8 +55,9 @@ export async function runAgent(system: string, history: ChatMessage[], emit: Emi
 let openaiClient: OpenAI | null = null;
 function getOpenAI(): OpenAI {
   if (!openaiClient) {
-    if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not set");
-    openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const apiKey = envValue("OPENAI_API_KEY");
+    if (!apiKey) throw new Error("OPENAI_API_KEY is not set");
+    openaiClient = new OpenAI({ apiKey });
   }
   return openaiClient;
 }
@@ -144,8 +146,9 @@ async function runOpenAI(system: string, history: ChatMessage[], emit: Emit): Pr
 let anthropicClient: Anthropic | null = null;
 function getAnthropic(): Anthropic {
   if (!anthropicClient) {
-    if (!process.env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY is not set");
-    anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const apiKey = envValue("ANTHROPIC_API_KEY");
+    if (!apiKey) throw new Error("ANTHROPIC_API_KEY is not set");
+    anthropicClient = new Anthropic({ apiKey });
   }
   return anthropicClient;
 }

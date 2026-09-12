@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=__AGENT_OPS_DIR__
 EnvironmentFile=/etc/agent-ops.env
+Environment="PATH=/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ExecStart=/usr/bin/npm run manager:start
 Restart=on-failure
 RestartSec=5

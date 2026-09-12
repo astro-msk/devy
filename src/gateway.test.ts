@@ -175,6 +175,52 @@ test("HEAD /api/hello is answered locally", async () => {
   }
 });
 
+test("live routing preserves the launch account and protocol when following defaults", async () => {
+  const t = await harness((u) => [
+    keyRoute("a", u, "KEY_A"),
+    keyRoute("b", u, "KEY_B"),
+    keyRoute("codex", u, "KEY_A", { lane: "codex" }),
+    keyRoute("personal", u, "KEY_A", { auth: { type: "passthrough" }, account: "claude-personal" }),
+    keyRoute("business", u, "KEY_A", { auth: { type: "passthrough" }, account: "claude-business" })
+  ]);
+  try {
+    t.gateway.assign("s1", { route: "personal", account: "claude-personal" });
+    assert.throws(() => t.gateway.assign("s1", { route: "business" }), /different login/);
+    assert.throws(() => t.gateway.assign("s1", { account: "claude-business" }), /keeps its launch account/);
+    t.gateway.assign("s1", { route: "a" });
+    t.gateway.assign("s1", { route: null, mode: "auto" });
+    assert.equal(t.gateway.assignment("s1")?.account, "claude-personal");
+    assert.throws(() => t.gateway.assign("s1", { route: "codex" }), /protocols/);
+    t.gateway.assign("key-only", { route: "a", account: null });
+    assert.throws(() => t.gateway.assign("key-only", { route: "personal" }), /different login/);
+    assert.ok(!t.gateway.candidates("claude", "key-only", true).chain.some((r) => r.auth.type === "passthrough"));
+  } finally { await t.close(); }
+});
+
+test("stream failures are not recorded as successful provider responses", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "gw-stream-"));
+  const gateway = new Gateway({
+    stateFile: path.join(dir, "state.json"),
+    catalog: [keyRoute("a", "https://upstream.invalid", "KEY_A")],
+    env: { KEY_A: "test" },
+    fetchImpl: async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("event: ping\ndata: {}\n\n"));
+        setTimeout(() => controller.error(new Error("upstream connection lost")), 20);
+      }
+    }), { headers: { "content-type": "text/event-stream" } })
+  });
+  const server = createGatewayServer(gateway);
+  const base = await listen(server);
+  try {
+    const response = await fetch(`${base}/claude/stream/v1/messages`, { method: "POST", body: "{}" });
+    await assert.rejects(response.text());
+    assert.equal(gateway.counters("a").lastOkAt, null);
+    assert.match(gateway.log.at(-1)?.error || "", /upstream connection lost/);
+    assert.equal(gateway.log.at(-1)?.outcome, "failed");
+  } finally { server.closeAllConnections(); server.close(); }
+});
+
 test("extractUsage merges Anthropic SSE usage and reads OpenAI usage", () => {
   const sse = [
     'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":120,"cache_read_input_tokens":100,"output_tokens":1}}}',

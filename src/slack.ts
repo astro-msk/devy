@@ -2,11 +2,14 @@ import os from "node:os";
 import path from "node:path";
 import { App, LogLevel } from "@slack/bolt";
 import type { KnownBlock } from "@slack/types";
+import { envValue } from "./config.js";
 import { getSlackThread, saveSlackThread, type EventRecord } from "./db.js";
 import { getGitStatus } from "./git.js";
+import { redactSecrets } from "./redact.js";
 import { registerDevySlackAgent } from "./slack-agent.js";
 
 const alertTypes = new Set(["approval_required", "notification", "error"]);
+const WEBHOOK_TIMEOUT_MS = 10_000;
 let slackApp: App | null = null;
 let slackStarted = false;
 
@@ -21,14 +24,14 @@ type SlackThreadMessage = {
 };
 
 export function shouldAlert(type: string): boolean {
-  if (process.env.ENABLE_AGENT_ALERTS === "false") return false;
+  if (!envValue("ENABLE_AGENT_ALERTS")) return false;
   return alertTypes.has(type);
 }
 
 export async function sendSlackAlert(event: EventRecord, session: string, repoPath: string): Promise<void> {
-  const webhookUrl = process.env.SLACK_WEBHOOK_URL;
-  const botToken = process.env.SLACK_BOT_TOKEN;
-  const channelId = process.env.SLACK_CHANNEL_ID;
+  const webhookUrl = envValue("SLACK_WEBHOOK_URL");
+  const botToken = envValue("SLACK_BOT_TOKEN");
+  const channelId = envValue("SLACK_CHANNEL_ID");
   if (!shouldAlert(event.type)) return;
 
   const git = await getGitStatus(repoPath);
@@ -73,8 +76,12 @@ export async function sendSlackAlert(event: EventRecord, session: string, repoPa
 
   if (!webhookUrl) return;
   try {
+    // The Bolt client retries and honours Retry-After on its own; the raw
+    // webhook needs at least a deadline so a stalled connection cannot hold
+    // an alert delivery open indefinitely.
     const response = await fetch(webhookUrl, {
       method: "POST",
+      signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         text,
@@ -99,15 +106,15 @@ export function startSlackInputListener(
   sendInput: (session: string, text: string, submit: boolean, source: string) => Promise<void>
 ): void {
   if (slackStarted) return;
-  if (process.env.SLACK_SOCKET_MODE !== "true") {
+  if (!envValue("SLACK_SOCKET_MODE")) {
     console.log("Slack Socket Mode listener disabled: SLACK_SOCKET_MODE is not true");
     return;
   }
-  if (!process.env.SLACK_APP_TOKEN || !process.env.SLACK_BOT_TOKEN) {
+  if (!envValue("SLACK_APP_TOKEN") || !envValue("SLACK_BOT_TOKEN")) {
     console.warn("Slack Socket Mode listener disabled: SLACK_APP_TOKEN or SLACK_BOT_TOKEN missing");
     return;
   }
-  if (process.env.ENABLE_AGENT_INPUT !== "true") {
+  if (!envValue("ENABLE_AGENT_INPUT")) {
     console.warn("Slack Socket Mode listener active but ENABLE_AGENT_INPUT is not true — thread replies will be rejected at the tmux layer.");
   }
 
@@ -180,7 +187,7 @@ export function cleanSlackMessageText(text: string): string {
 }
 
 function resolveSlackLogLevel(): LogLevel {
-  const requested = process.env.SLACK_LOG_LEVEL?.trim().toLowerCase();
+  const requested = envValue("SLACK_LOG_LEVEL");
   if (requested === "debug") return LogLevel.DEBUG;
   if (requested === "warn") return LogLevel.WARN;
   if (requested === "error") return LogLevel.ERROR;
@@ -190,9 +197,9 @@ function resolveSlackLogLevel(): LogLevel {
 function ensureSlackApp(): App {
   if (!slackApp) {
     slackApp = new App({
-      token: process.env.SLACK_BOT_TOKEN,
-      appToken: process.env.SLACK_APP_TOKEN,
-      socketMode: process.env.SLACK_SOCKET_MODE === "true",
+      token: envValue("SLACK_BOT_TOKEN"),
+      appToken: envValue("SLACK_APP_TOKEN"),
+      socketMode: envValue("SLACK_SOCKET_MODE"),
       logLevel: resolveSlackLogLevel()
     });
   }
@@ -311,9 +318,9 @@ function asGenericUserMessage(message: unknown): SlackThreadMessage | null {
 }
 
 export function sanitizeSnippet(value: string): string {
-  return value
-    .replace(/(token|secret|password|api[_-]?key|authorization)\s*[:=]\s*["']?[\w./+=:-]+/gi, "$1=[redacted]")
-    .replace(/\b[A-Za-z0-9_-]{32,}\b/g, "[redacted]")
+  // Alerts quote raw tmux output, where a pasted key is likelier than in
+  // prose, so the bare-token threshold is tighter than for Codex replies.
+  return redactSecrets(value, { minTokenLength: 32 })
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 240);

@@ -73,7 +73,7 @@ test("plain listener keeps trusting localhost for reads and writes", async () =>
 });
 
 test("tunnel listener without a JWT: 401 for health, API, static files and the SPA fallback", async () => {
-  for (const route of ["/api/health", "/api/sessions", "/", "/app.js", "/manifest.json", "/some/deep/link"]) {
+  for (const route of ["/api/health", "/api/sessions", "/", "/app.js", "/manifest.json", "/remote/", "/remote/app.js", "/some/deep/link"]) {
     const res = await fetch(`${tunnelUrl}${route}`);
     assert.equal(res.status, 401, `${route} should be refused`);
     assert.equal(res.headers.get("cache-control"), "no-store");
@@ -102,10 +102,13 @@ test("tunnel listener rejects bad JWTs (wrong audience, expired, stranger, forei
   }
 });
 
-test("tunnel + valid JWT: reads work, writes still need the write token", async () => {
+test("Cloudflare login grants reads and writes without a second token", async () => {
   const health = await fetch(`${tunnelUrl}/api/health`, { headers: { "cf-access-jwt-assertion": jwt } });
   assert.equal(health.status, 200);
-  assert.equal((await health.json()).app, "devy");
+  const healthBody = await health.json();
+  assert.equal(healthBody.app, "devy");
+  assert.equal(healthBody.authentication, "cloudflare");
+  assert.equal(healthBody.tokenRequired, false);
   assert.equal(health.headers.get("strict-transport-security"), "max-age=15552000; includeSubDomains");
 
   const page = await fetch(`${tunnelUrl}/`, { headers: { "cf-access-jwt-assertion": jwt } });
@@ -113,13 +116,12 @@ test("tunnel + valid JWT: reads work, writes still need the write token", async 
   assert.match(page.headers.get("content-type") || "", /text\/html/);
   assert.match(page.headers.get("content-security-policy") || "", /frame-ancestors 'none'/);
 
-  // cloudflared connects from 127.0.0.1, which must not unlock the localhost write path.
+  // The signed Access identity authorizes writes; localhost alone still cannot.
   const noToken = await postEvent(tunnelUrl, { "cf-access-jwt-assertion": jwt });
-  assert.equal(noToken.status, 401);
-  assert.equal((await noToken.json()).error, "unauthorized");
+  assert.equal(noToken.status, 201);
 
   const wrongToken = await postEvent(tunnelUrl, { "cf-access-jwt-assertion": jwt, authorization: "Bearer wrong" });
-  assert.equal(wrongToken.status, 401);
+  assert.equal(wrongToken.status, 201);
 });
 
 test("tunnel + valid JWT + write token: writes succeed", async () => {
@@ -128,9 +130,41 @@ test("tunnel + valid JWT + write token: writes succeed", async () => {
   assert.equal((await res.json()).ok, true);
 });
 
+test("remote manager is served under the same authenticated origin", async () => {
+  const response = await fetch(`${tunnelUrl}/remote/`, { headers: { "cf-access-jwt-assertion": jwt } });
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /Devy Remote/);
+  assert.equal(response.headers.get("cache-control"), "no-cache");
+});
+
+test("tunnel accepts Cloudflare-approved identities without a local allowlist", async () => {
+  const config = { teamDomain: fake.teamDomain, audience: fake.audience, jwksUrl: fake.jwksUrl, jwksCooldownMs: 0 };
+  configureAccess({ ...config, allowedEmails: [] });
+  try {
+    const token = await fake.sign({ sub: "service-identity" });
+    const headers = { "cf-access-jwt-assertion": token };
+    assert.equal((await fetch(`${tunnelUrl}/api/health`, { headers })).status, 200);
+    assert.equal((await postEvent(tunnelUrl, headers)).status, 201);
+    assert.equal((await postEvent(tunnelUrl, { ...headers, authorization: `Bearer ${WRITE_TOKEN}` })).status, 201);
+  } finally {
+    configureAccess({ ...config, allowedEmails: [EMAIL] });
+  }
+});
+
 test("write token alone is not enough on the tunnel", async () => {
   const res = await postEvent(tunnelUrl, { authorization: `Bearer ${WRITE_TOKEN}` });
   assert.equal(res.status, 401);
+});
+
+test("Cloudflare cookies cannot authorize cross-origin browser commands", async () => {
+  const headers = { "cf-access-jwt-assertion": jwt };
+  assert.equal((await postEvent(tunnelUrl, { ...headers, origin: "https://attacker.example" })).status, 403);
+  assert.equal((await postEvent(tunnelUrl, { ...headers, origin: "null" })).status, 403);
+  assert.equal((await postEvent(tunnelUrl, { ...headers, "sec-fetch-site": "cross-site" })).status, 403);
+  assert.equal((await postEvent(tunnelUrl, { ...headers, origin: tunnelUrl.replace("http:", "https:") })).status, 201);
+  assert.equal(await upgradeStatus(`${wsUrl(tunnelUrl)}/ws/terminal?session=devy-test`, {
+    ...headers, origin: "https://attacker.example"
+  }), 401);
 });
 
 test("tunnel writes are rate limited per identity", async () => {
@@ -163,10 +197,10 @@ test("WebSocket upgrade on the tunnel without a JWT is refused with 401", async 
   assert.equal(status, 401);
 });
 
-test("WebSocket upgrade on the tunnel with a JWT opens read-only; with the write token it can type", async () => {
+test("WebSocket terminal accepts Cloudflare login without a second token", async () => {
   const readOnly = await firstMessage(`${wsUrl(tunnelUrl)}/ws/terminal?session=devy-test`, jwt);
   assert.equal(readOnly.type, "ready");
-  assert.equal(readOnly.canWrite, false);
+  assert.equal(readOnly.canWrite, true);
 
   const writable = await firstMessage(
     `${wsUrl(tunnelUrl)}/ws/terminal?session=devy-test&token=${encodeURIComponent(WRITE_TOKEN)}`,
@@ -240,9 +274,9 @@ async function postEvent(base: string, headers: Record<string, string>): Promise
   });
 }
 
-function upgradeStatus(url: string): Promise<number> {
+function upgradeStatus(url: string, headers: Record<string, string> = {}): Promise<number> {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url);
+    const socket = new WebSocket(url, { headers });
     socket.on("unexpected-response", (_req, res) => {
       resolve(res.statusCode || 0);
       res.resume();

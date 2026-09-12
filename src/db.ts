@@ -1,6 +1,7 @@
-import Database from "better-sqlite3";
+import Database, { type Statement } from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
+import { envValue } from "./config.js";
 
 export type EventAgent = "claude" | "codex" | "system";
 export type EventType = "notification" | "approval_required" | "completed" | "error" | "info";
@@ -70,6 +71,26 @@ mkdirSync(dataDir, { recursive: true });
 
 const db = new Database(path.join(dataDir, "agent-ops.sqlite"));
 db.pragma("journal_mode = WAL");
+// The dashboard (agent-ops) and the session manager (agent-sessions) open this
+// file from two processes. Without a busy timeout a write that lands while the
+// other process holds the lock fails instantly with SQLITE_BUSY instead of
+// waiting a few milliseconds.
+db.pragma("busy_timeout = 5000");
+// With WAL, NORMAL still guarantees consistency after a crash; only the last
+// transactions before a power loss can roll back, which is fine for event logs.
+db.pragma("synchronous = NORMAL");
+
+// Statements are compiled once per process and reused. Hot paths (event stream
+// polling, monitor ticks) call the same handful of queries every few seconds.
+const statementCache = new Map<string, Statement>();
+function prepared(sql: string): Statement {
+  let statement = statementCache.get(sql);
+  if (!statement) {
+    statement = db.prepare(sql);
+    statementCache.set(sql, statement);
+  }
+  return statement;
+}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS events (
@@ -211,7 +232,83 @@ export function createEvent(input: EventInput): EventRecord {
     raw_json: rawJson
   });
 
+  pruneIfDue();
   return getEvent(Number(result.lastInsertRowid));
+}
+
+// ── Retention ──────────────────────────────────────────────────────────────
+// Events arrive from every hook and monitor tick, so the file grew without
+// bound (6 MB after four months). Pruning piggybacks on writes: the table only
+// grows when something is inserted, so that is exactly when a sweep is due,
+// and it needs no timer wiring in the entry points.
+const PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+let lastPruneAt = 0;
+
+export type PruneResult = {
+  events: number;
+  slackThreads: number;
+  slackChatTurns: number;
+  slackTriage: number;
+};
+
+/**
+ * Delete rows older than `retentionDays`. Slack alert threads die with their
+ * events (a reply to a months-old alert has no session to reach), and only
+ * triage rows in a terminal state are removed so nothing awaiting approval is
+ * ever lost. Returns how many rows each table dropped.
+ */
+export function pruneOldRecords(retentionDays: number = envValue("EVENT_RETENTION_DAYS")): PruneResult {
+  const cutoff = `-${Math.max(1, Math.round(retentionDays))} days`;
+  const sweep = db.transaction((modifier: string): PruneResult => {
+    const events = prepared("DELETE FROM events WHERE created_at < datetime('now', ?)").run(modifier).changes;
+    const slackThreads = prepared(`
+      DELETE FROM slack_threads
+      WHERE created_at < datetime('now', ?)
+         OR event_id NOT IN (SELECT id FROM events)
+    `).run(modifier).changes;
+    const slackChatTurns = prepared("DELETE FROM slack_chat_turns WHERE created_at < datetime('now', ?)").run(modifier).changes;
+    const slackTriage = prepared(`
+      DELETE FROM slack_triage
+      WHERE updated_at < datetime('now', ?)
+        AND status IN ('completed', 'dismissed', 'failed')
+    `).run(modifier).changes;
+    return { events, slackThreads, slackChatTurns, slackTriage };
+  });
+  const result = sweep(cutoff);
+  if (result.events || result.slackThreads || result.slackChatTurns || result.slackTriage) {
+    // Hand freed pages back to the WAL/checkpoint machinery so the -wal file
+    // does not keep the deleted data alive. Best effort: another connection
+    // holding a read lock just makes it a partial checkpoint.
+    try {
+      db.pragma("wal_checkpoint(PASSIVE)");
+    } catch {
+      // checkpoint is an optimisation, never a correctness requirement
+    }
+  }
+  return result;
+}
+
+function pruneIfDue(): void {
+  const now = Date.now();
+  if (now - lastPruneAt < PRUNE_INTERVAL_MS) return;
+  lastPruneAt = now;
+  try {
+    const dropped = pruneOldRecords();
+    const total = dropped.events + dropped.slackThreads + dropped.slackChatTurns + dropped.slackTriage;
+    if (total) console.log(`[Devy] pruned ${total} rows older than ${envValue("EVENT_RETENTION_DAYS")} days from SQLite`);
+  } catch (error) {
+    // A failed sweep must never fail the write that triggered it.
+    console.warn(`[Devy] SQLite retention sweep failed: ${(error as Error).message}`);
+  }
+}
+
+/** Connection-level settings, exposed for tests and diagnostics. */
+export function connectionSettings(): { journalMode: string; busyTimeoutMs: number; synchronous: number } {
+  return {
+    journalMode: String(db.pragma("journal_mode", { simple: true })),
+    busyTimeoutMs: Number(db.pragma("busy_timeout", { simple: true })),
+    synchronous: Number(db.pragma("synchronous", { simple: true }))
+  };
 }
 
 export function getRecentEvents(limit = 50): EventRecord[] {
@@ -253,7 +350,7 @@ export function createSlackTriage(input: SlackTriageInput): { record: SlackTriag
 }
 
 export function saveSlackTriageContext(id: number, context: unknown, permalink: string | null): void {
-  db.prepare(`
+  prepared(`
     UPDATE slack_triage
     SET context_json = ?, permalink = ?, updated_at = datetime('now')
     WHERE id = ?
@@ -261,7 +358,7 @@ export function saveSlackTriageContext(id: number, context: unknown, permalink: 
 }
 
 export function saveSlackTriageAnalysis(id: number, analysis: unknown): void {
-  db.prepare(`
+  prepared(`
     UPDATE slack_triage
     SET analysis_json = ?, updated_at = datetime('now')
     WHERE id = ?
@@ -274,7 +371,7 @@ export function saveSlackTriageReport(
   reportThreadTs: string,
   status: SlackTriageStatus
 ): void {
-  db.prepare(`
+  prepared(`
     UPDATE slack_triage
     SET report_channel_id = ?,
         report_thread_ts = ?,
@@ -286,7 +383,7 @@ export function saveSlackTriageReport(
 }
 
 export function acknowledgeSlackTriage(id: number): boolean {
-  const result = db.prepare(`
+  const result = prepared(`
     UPDATE slack_triage
     SET acknowledged_at = datetime('now'), updated_at = datetime('now')
     WHERE id = ? AND acknowledged_at IS NULL
@@ -295,7 +392,7 @@ export function acknowledgeSlackTriage(id: number): boolean {
 }
 
 export function listSlackTriageNeedingPing(quietMinutes: number): SlackTriageRecord[] {
-  const rows = db.prepare(`
+  const rows = prepared(`
     SELECT * FROM slack_triage
     WHERE acknowledged_at IS NULL
       AND report_thread_ts IS NOT NULL
@@ -309,7 +406,7 @@ export function listSlackTriageNeedingPing(quietMinutes: number): SlackTriageRec
 }
 
 export function recordSlackTriagePing(id: number): void {
-  db.prepare(`
+  prepared(`
     UPDATE slack_triage
     SET last_ping_at = datetime('now'), ping_count = ping_count + 1
     WHERE id = ?
@@ -331,7 +428,7 @@ export function getSlackTriageById(id: number): SlackTriageRecord | null {
 export function listSlackTriageByStatus(statuses: SlackTriageStatus[]): SlackTriageRecord[] {
   if (!statuses.length) return [];
   const placeholders = statuses.map(() => "?").join(", ");
-  const rows = db.prepare(`
+  const rows = prepared(`
     SELECT * FROM slack_triage
     WHERE status IN (${placeholders})
     ORDER BY id
@@ -346,7 +443,7 @@ export function transitionSlackTriage(
   from: SlackTriageStatus,
   to: SlackTriageStatus
 ): boolean {
-  const result = db.prepare(`
+  const result = prepared(`
     UPDATE slack_triage
     SET status = ?, updated_at = datetime('now')
     WHERE id = ? AND status = ?
@@ -360,7 +457,7 @@ export function finishSlackTriage(
   result: string,
   prUrl: string | null = null
 ): void {
-  db.prepare(`
+  prepared(`
     UPDATE slack_triage
     SET status = ?, result_text = ?, pr_url = ?, updated_at = datetime('now')
     WHERE id = ?
@@ -375,14 +472,14 @@ export function appendSlackChatTurn(
   role: SlackChatTurn["role"],
   text: string
 ): void {
-  db.prepare(`
+  prepared(`
     INSERT INTO slack_chat_turns (channel_id, thread_ts, role, text)
     VALUES (?, ?, ?, ?)
   `).run(channelId, threadTs, role, text.slice(0, 20000));
 }
 
 export function listSlackChatTurns(channelId: string, threadTs: string, limit: number): SlackChatTurn[] {
-  const rows = db.prepare(`
+  const rows = prepared(`
     SELECT role, text
     FROM slack_chat_turns
     WHERE channel_id = ? AND thread_ts = ?
@@ -449,9 +546,7 @@ function normalizeRaw(input: EventInput): unknown {
 }
 
 function getEvent(id: number): EventRecord {
-  const row = db
-    .prepare("SELECT id, agent, type, message, raw_json, created_at FROM events WHERE id = ?")
-    .get(id);
+  const row = prepared("SELECT id, agent, type, message, raw_json, created_at FROM events WHERE id = ?").get(id);
   if (!row) {
     throw new Error(`event ${id} was not stored`);
   }

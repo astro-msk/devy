@@ -9,7 +9,7 @@ import { authenticateAccessRequest, type AccessIdentity } from "./cf-access.js";
 //   - the Cloudflare tunnel listener: cloudflared connects from 127.0.0.1, so
 //     these connections would look like localhost. They are marked per socket
 //     at accept time and treated as hostile until a Cloudflare Access JWT has
-//     been verified — after which they get tailnet privileges, never localhost.
+//     been verified — after which the Access policy grants read/write access.
 // The mark lives on the socket rather than in a header because a localhost
 // caller can send any `cf-*` header it likes.
 
@@ -56,14 +56,13 @@ export function requireWriteAuth(req: Request, res: Response, next: NextFunction
       res.status(401).json({ ok: false, error: "cloudflare access required" });
       return;
     }
-    // The Access JWT proves who is at the keyboard; the write token is still
-    // the second factor the PWA stores, so a stolen Access session alone
-    // cannot type into an agent.
-    if (!tokenMatches(readBearer(req) || req.header("x-agent-ops-token"))) {
-      res.status(401).json({ ok: false, error: "unauthorized" });
+    // Access authenticates browsers with cookies. Do not let an unrelated
+    // website use that login to submit commands to a session.
+    if (!sameOrigin(requestOrigin(req), req.headers.host)) {
+      res.status(403).json({ ok: false, error: "cross-origin writes are not allowed" });
       return;
     }
-    if (!tunnelWriteLimiter.allow(identity.email)) {
+    if (!tunnelWriteLimiter.allow(identity.subject)) {
       res.status(429).set("retry-after", String(Math.ceil(TUNNEL_WRITE_WINDOW_MS / 1000))).json({ ok: false, error: "too many write requests" });
       return;
     }
@@ -109,6 +108,7 @@ export function requireTailnetRead(req: Request, res: Response, next: NextFuncti
 // Watching a pane follows the read rules; typing into it follows the write rules.
 export async function socketReadAllowed(request: IncomingMessage): Promise<boolean> {
   if (isTunnelRequest(request)) {
+    if (!sameOrigin(requestOrigin(request), request.headers.host)) return false;
     const result = await authenticateAccessRequest(request);
     if (!result.ok) return false;
     identities.set(request, result.identity);
@@ -120,7 +120,7 @@ export async function socketReadAllowed(request: IncomingMessage): Promise<boole
 }
 
 export function socketWriteAllowed(request: IncomingMessage, token: string | null): boolean {
-  if (isTunnelRequest(request)) return identities.has(request) && tokenMatches(token);
+  if (isTunnelRequest(request)) return identities.has(request);
   const remote = request.socket.remoteAddress;
   if (process.env.TAILSCALE_ONLY === "true" && !(isLocalhost(remote) || isTailscaleIp(remote))) return false;
   if (isLocalhost(remote)) return true;
@@ -129,7 +129,7 @@ export function socketWriteAllowed(request: IncomingMessage, token: string | nul
 
 // Fixed-window limiter for writes arriving through the tunnel, per Access
 // identity. Generous enough for a human on the dashboard, tight enough that a
-// leaked write token cannot be used to hammer the box from the internet.
+// repeated commands cannot hammer the box from the internet.
 const TUNNEL_WRITE_WINDOW_MS = 60_000;
 const TUNNEL_WRITE_LIMIT = 120;
 
@@ -164,6 +164,19 @@ class FixedWindowLimiter {
 }
 
 export const tunnelWriteLimiter = new FixedWindowLimiter(TUNNEL_WRITE_LIMIT, TUNNEL_WRITE_WINDOW_MS);
+
+function requestOrigin(request: IncomingMessage): string | undefined {
+  if (request.headers["sec-fetch-site"] === "cross-site") return "null";
+  return request.headers.origin;
+}
+
+function sameOrigin(origin: string | undefined, host: string | undefined): boolean {
+  // Non-browser API clients present their own valid Access assertion and may
+  // omit Origin. Browser POSTs and WebSocket handshakes supply it.
+  if (!origin) return true;
+  try { return new URL(origin).origin === new URL(`https://${host}`).origin; }
+  catch { return false; }
+}
 
 function tokenMatches(actual: string | null | undefined): boolean {
   const expected = process.env.AGENT_OPS_TOKEN;

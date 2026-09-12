@@ -6,15 +6,6 @@ const execFileAsync = promisify(execFile);
 
 export type AgentState = "running" | "waiting_for_input" | "error" | "idle" | "unknown";
 
-export type TmuxSnapshot = {
-  session: string;
-  running: boolean;
-  state: AgentState;
-  lastOutput: string;
-  outputHash: string;
-  lastActivity: string | null;
-};
-
 const waitingPatterns = [
   { reason: "proceed_prompt", pattern: /Do you want to proceed\?/i },
   { reason: "approval_prompt", pattern: /\bApprove\b/i },
@@ -46,36 +37,31 @@ const errorPatterns = [
   /\bUnhandledPromiseRejection\b/
 ];
 
-export async function inspectSession(session: string): Promise<TmuxSnapshot> {
-  if (!(await sessionExists(session))) {
-    return {
-      session,
-      running: false,
-      state: "unknown",
-      lastOutput: "",
-      outputHash: "",
-      lastActivity: null
-    };
-  }
+export const MAX_INPUT_CHARS = 4000;
 
-  const [capture, pane] = await Promise.all([
-    execTmux(["capture-pane", "-t", session, "-p", "-S", "-120"]),
-    execTmux(["list-panes", "-t", session, "-F", "#{pane_active} #{pane_current_command} #{pane_pid} #{pane_start_command}"])
-  ]);
+export type TmuxCommand = { args: string[]; failure: string };
 
-  const lastOutput = capture.stdout.trim().slice(-4000);
-  const lastActivity = new Date().toISOString();
-  const outputHash = crypto.createHash("sha256").update(lastOutput).digest("hex");
-  const paneText = pane.stdout.trim();
-
-  return {
-    session,
-    running: paneText.length > 0,
-    state: inferState(lastOutput),
-    lastOutput,
-    outputHash,
-    lastActivity
-  };
+/**
+ * The tmux invocations that deliver `text` to `session`, in order. Pure, so the
+ * argument shapes (notably the `--` guards) are unit-testable without tmux.
+ *
+ * Multi-line text is risky to send with `send-keys -l` because embedded
+ * newlines become submission events in most TUIs. It goes through a tmux
+ * buffer + paste-buffer with bracketed paste (`-p`) so the target app treats
+ * it as one paste; `-d` deletes the buffer afterwards.
+ *
+ * Every user-supplied string sits after `--`: tmux parses options getopt-style,
+ * so text such as "--force" or "-h" is otherwise rejected as an invalid flag.
+ */
+export function planInput(session: string, text: string, submit: boolean, bufferName: string): TmuxCommand[] {
+  const commands: TmuxCommand[] = text.includes("\n")
+    ? [
+        { args: ["set-buffer", "-b", bufferName, "--", text], failure: "tmux set-buffer failed" },
+        { args: ["paste-buffer", "-b", bufferName, "-t", session, "-p", "-d"], failure: "tmux paste-buffer failed" }
+      ]
+    : [{ args: ["send-keys", "-t", session, "-l", "--", text], failure: "tmux send-keys failed" }];
+  if (submit) commands.push({ args: ["send-keys", "-t", session, "Enter"], failure: "tmux send-keys failed" });
+  return commands;
 }
 
 export async function sendInputToSession(session: string, text: string, submit: boolean): Promise<void> {
@@ -83,28 +69,15 @@ export async function sendInputToSession(session: string, text: string, submit: 
     throw new Error(`tmux session not found: ${session}`);
   }
 
-  const trimmed = text.slice(0, 4000);
+  const trimmed = text.slice(0, MAX_INPUT_CHARS);
   if (trimmed.length === 0) {
     throw new Error("input text is empty");
   }
 
-  // Multi-line text is risky to send with `send-keys -l` because embedded newlines
-  // become submission events in most TUIs. Use a tmux buffer + paste-buffer with
-  // bracketed-paste so the target app (Claude Code, Codex, shells) treats it as
-  // a single paste rather than a stream of line submits.
-  if (trimmed.includes("\n")) {
-    const bufferName = `agentops_${process.pid}_${Date.now().toString(36)}`;
-    const set = await execTmux(["set-buffer", "-b", bufferName, trimmed]);
-    if (set.code !== 0) throw new Error(set.stderr || "tmux set-buffer failed");
-    // `-p` enables bracketed paste; `-d` deletes the buffer after pasting.
-    const paste = await execTmux(["paste-buffer", "-b", bufferName, "-t", session, "-p", "-d"]);
-    if (paste.code !== 0) throw new Error(paste.stderr || "tmux paste-buffer failed");
-  } else {
-    await sendKeys(["send-keys", "-t", session, "-l", trimmed]);
-  }
-
-  if (submit) {
-    await sendKeys(["send-keys", "-t", session, "Enter"]);
+  const bufferName = `agentops_${process.pid}_${Date.now().toString(36)}_${crypto.randomBytes(3).toString("hex")}`;
+  for (const command of planInput(session, trimmed, submit, bufferName)) {
+    const result = await execTmux(command.args);
+    if (result.code !== 0) throw new Error(result.stderr.trim() || command.failure);
   }
 }
 
@@ -173,14 +146,12 @@ async function execTmux(args: string[]): Promise<{ code: number; stdout: string;
     });
     return { code: 0, stdout, stderr };
   } catch (error) {
-    const err = error as { code?: number; stdout?: string; stderr?: string };
-    return { code: err.code ?? 1, stdout: err.stdout ?? "", stderr: err.stderr ?? "" };
-  }
-}
-
-async function sendKeys(args: string[]): Promise<void> {
-  const result = await execTmux(args);
-  if (result.code !== 0) {
-    throw new Error(result.stderr || "tmux send-keys failed");
+    // A spawn failure (tmux missing, timeout) carries a string code such as
+    // "ENOENT"; a non-zero exit carries a number. Both must read as failure,
+    // and the message should say which it was.
+    const err = error as { code?: number | string; stdout?: string; stderr?: string; killed?: boolean; message?: string };
+    const code = typeof err.code === "number" ? err.code : 1;
+    const stderr = err.stderr?.trim() || (err.killed ? "tmux timed out" : typeof err.code === "string" ? `tmux: ${err.code}` : "");
+    return { code, stdout: err.stdout ?? "", stderr };
   }
 }

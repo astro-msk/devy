@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { mkdir, readFile, statfs, writeFile } from "node:fs/promises";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { z } from "zod";
-import { requireTailnetRead, requireTunnelAccess, requireWriteAuth } from "./auth.js";
+import { isTunnelRequest, requireTailnetRead, requireTunnelAccess, requireWriteAuth } from "./auth.js";
 import { securityHeaders } from "./security-headers.js";
 import { activeModel, aiConfigured, providerName, streamAsk } from "./ai.js";
 import {
@@ -18,8 +18,10 @@ import {
   saveMemory,
   searchMemories
 } from "./ai-memory.js";
+import { assertValidConfig } from "./config.js";
 import { getRecentEvents } from "./db.js";
 import { findAccount, gatewayUrl } from "./gateway-config.js";
+import type { Gateway } from "./gateway-core.js";
 import {
   accountStatuses,
   findRoute,
@@ -40,6 +42,7 @@ import {
   sendAgentInput,
   sendSessionInput
 } from "./monitor.js";
+import { installProcessGuards } from "./process-guards.js";
 import { listProjects } from "./projects.js";
 import { buildAllIndices } from "./repo-index.js";
 import {
@@ -80,12 +83,17 @@ const createSessionSchema = z.object({
     .regex(/^[A-Za-z0-9_.:-]+$/),
   agent: z.enum(["claude", "codex"]),
   directory: z.string().min(1).max(500),
-  /** Gateway route id; omitted or "direct" launches the agent with its own default provider. */
+  /** Omitted selects an available gateway route; "direct" explicitly bypasses it. */
   route: z.string().max(60).optional()
 });
 
 const routeIdSchema = z.string().min(1).max(60).regex(/^[a-z0-9-]+$/);
 const accountIdSchema = z.string().min(1).max(60).regex(/^[a-z0-9-]+$/);
+const assignmentPatchSchema = z.object({
+  route: routeIdSchema.nullable().optional(),
+  mode: z.enum(["auto", "pinned"]).optional()
+}).strict();
+type GatewayView = ReturnType<Gateway["view"]>;
 
 const claudePermissionSchema = z.object({
   directory: z.string().min(1).max(500),
@@ -114,10 +122,14 @@ const memorySchema = z.object({
   id: z.string().regex(/^[a-f0-9]{1,32}$/).optional()
 });
 
-export function createApp(): Express {
+export function createApp(options: { webDir?: string } = {}): Express {
+  // Both entry points (server.ts, session-manager.ts) build the app, so this is
+  // the one place a bad env var fails fast for every process.
+  assertValidConfig();
+  installProcessGuards();
   const app = express();
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const webDir = path.resolve(__dirname, "../web");
+  const webDir = options.webDir ?? path.resolve(__dirname, "../web");
   const projectRoot = path.resolve(__dirname, "..");
 
   app.set("trust proxy", false);
@@ -135,7 +147,7 @@ export function createApp(): Express {
   app.use("/vendor/xterm-addon-search", express.static(path.join(projectRoot, "node_modules/@xterm/addon-search/lib")));
   app.use("/vendor/xterm-addon-unicode11", express.static(path.join(projectRoot, "node_modules/@xterm/addon-unicode11/lib")));
 
-  app.get("/api/health", (_req, res) => {
+  app.get("/api/health", (req, res) => {
     res.json({
       ok: true,
       app: "devy",
@@ -144,7 +156,8 @@ export function createApp(): Express {
       aiEnabled: aiConfigured(),
       agentInputEnabled: agentInputEnabled(),
       tailscaleOnly: process.env.TAILSCALE_ONLY === "true",
-      tokenRequired: Boolean(process.env.AGENT_OPS_TOKEN)
+      tokenRequired: !isTunnelRequest(req) && Boolean(process.env.AGENT_OPS_TOKEN),
+      authentication: isTunnelRequest(req) ? "cloudflare" : "tailnet"
     });
   });
 
@@ -187,11 +200,17 @@ export function createApp(): Express {
     let lastSeen = Number.isFinite(since) && since > 0 ? since : getRecentEvents(1)[0]?.id ?? 0;
 
     const tick = () => {
-      const events = getRecentEvents(50).filter((event) => event.id > lastSeen);
-      if (!events.length) return;
-      lastSeen = events[0].id;
-      for (const event of events.slice().reverse()) {
-        res.write(`id: ${event.id}\nevent: event\ndata: ${JSON.stringify(event)}\n\n`);
+      // Inside a timer there is no Express error handler: a throw here (SQLite
+      // briefly locked by the other process) would be an uncaught exception.
+      try {
+        const events = getRecentEvents(50).filter((event) => event.id > lastSeen);
+        if (!events.length) return;
+        lastSeen = events[0].id;
+        for (const event of events.slice().reverse()) {
+          res.write(`id: ${event.id}\nevent: event\ndata: ${JSON.stringify(event)}\n\n`);
+        }
+      } catch (error) {
+        console.warn(`[Devy] event stream tick failed: ${(error as Error).message}`);
       }
     };
 
@@ -243,10 +262,24 @@ export function createApp(): Express {
       return;
     }
     try {
-      const { name, agent, directory, route: routeId } = parsed.data;
+      const { name, agent, directory } = parsed.data;
+      let routeId = parsed.data.route;
       let launch: string | undefined;
       let spec: LaunchSpec | null = null;
-      if (routeId && routeId !== "direct") {
+      if (routeId !== "direct") {
+        // Check before registration so a duplicate name cannot change a live
+        // client's route as a side effect of a failed create request.
+        const live = await listManagedSessions(true);
+        if (live.some((session) => session.name === name)) throw new Error(`tmux session already exists: ${name}`);
+        const [state, accounts] = await Promise.all([
+          gatewayRequest<GatewayView>("GET", "/state"), accountStatuses()
+        ]);
+        const available = state.routes.filter((route) => route.lane === agent && route.available &&
+          (!route.account || accounts.some((account) => account.id === route.account && account.signedIn)));
+        routeId ??= available.find((route) => route.id === state.defaults[agent])?.id ??
+          state.order[agent].find((id) => available.some((route) => route.id === id));
+        if (!routeId) throw new Error(`no configured ${agent} gateway route; sign in or configure a provider in Gateway`);
+        if (!available.some((route) => route.id === routeId)) throw new Error(`route ${routeId} is disabled or requires provider setup`);
         const route = findRoute(routeId);
         if (!route || route.lane !== agent) throw new Error(`unknown ${agent} route: ${routeId}`);
         spec = await launchSpec(agent, name, route);
@@ -254,7 +287,12 @@ export function createApp(): Express {
         // Register before launch so the first request already resolves to the chosen route.
         await gatewayRequest("PUT", `/sessions/${name}`, { route: route.id, mode: "auto", account: spec.account });
       }
-      await createManagedSession(name, agent, directory, launch);
+      try {
+        await createManagedSession(name, agent, directory, launch);
+      } catch (error) {
+        if (spec) await gatewayRequest("DELETE", `/sessions/${name}`).catch(() => {});
+        throw error;
+      }
       res.status(201).json({ ok: true, route: spec ? routeId : "direct", account: spec?.account ?? null });
     } catch (error) {
       res.status(400).json({ ok: false, error: (error as Error).message });
@@ -291,11 +329,23 @@ export function createApp(): Express {
       return probeRoute(route);
     }));
 
+  const updateSessionRoute = async (req: express.Request, followDefault = false) => {
+    const session = sessionNameSchema.parse(req.params.session);
+    const [state, live] = await Promise.all([
+      gatewayRequest<GatewayView>("GET", "/state"), listManagedSessions(true)
+    ]);
+    if (!live.some((item) => item.name === session)) throw new Error("session no longer exists");
+    if (!state.assignments[session]) throw new Error("this session runs directly; create a gateway session to switch providers");
+    const patch = followDefault ? { route: null, mode: "auto" } : assignmentPatchSchema.parse(req.body);
+    // Following defaults retains the login used to launch the process. Deleting
+    // the assignment would lose that identity and permit an invalid fallback.
+    return gatewayRequest("PUT", `/sessions/${session}`, patch);
+  };
   app.put("/api/gateway/sessions/:session", requireWriteAuth, (req, res) =>
-    gatewayWrite(req, res, () => gatewayRequest("PUT", `/sessions/${sessionNameSchema.parse(req.params.session)}`, req.body)));
+    gatewayWrite(req, res, () => updateSessionRoute(req)));
 
   app.delete("/api/gateway/sessions/:session", requireWriteAuth, (req, res) =>
-    gatewayWrite(req, res, () => gatewayRequest("DELETE", `/sessions/${sessionNameSchema.parse(req.params.session)}`)));
+    gatewayWrite(req, res, () => updateSessionRoute(req, true)));
 
   app.post("/api/gateway/accounts/:account/login", requireWriteAuth, (req, res) =>
     gatewayWrite(req, res, async () => {
@@ -304,7 +354,7 @@ export function createApp(): Express {
       const session = loginSessionName(account.id);
       const live = await listManagedSessions(true);
       if (!live.some((s) => s.name === session)) {
-        await createManagedSession(session, account.lane, process.env.HOME || "/home/ubuntu", await loginCommand(account));
+        await createManagedSession(session, account.lane, process.env.HOME || "/home/ubuntu", await loginCommand(account), { closeOnSuccess: true });
       }
       return { ok: true, session };
     }));
@@ -475,7 +525,15 @@ export function createApp(): Express {
     res.json({ ok });
   });
 
-  app.use(express.static(webDir, { index: "index.html", extensions: ["html"] }));
+  const staticOptions = {
+    index: "index.html",
+    setHeaders: (res: express.Response, filePath: string) => {
+      res.setHeader("cache-control", /\.(svg|png|ico)$/.test(filePath) ? "public, max-age=86400" : "no-cache");
+    }
+  };
+  // The remote control shares the dashboard's Access policy and certificate.
+  app.use("/remote", express.static(path.join(projectRoot, "web-manager"), staticOptions));
+  app.use(express.static(webDir, staticOptions));
 
   // Unknown /api/* paths used to fall through to index.html, so a typo'd fetch
   // resolved with an HTML body and failed later at JSON.parse.
@@ -484,7 +542,8 @@ export function createApp(): Express {
   });
 
   app.get(/.*/, (_req, res) => {
-    res.sendFile(path.join(webDir, "index.html"));
+    res.setHeader("cache-control", "no-cache");
+    res.sendFile("index.html", { root: webDir });
   });
 
   // Without this, a throw inside any handler yields Express's HTML error page

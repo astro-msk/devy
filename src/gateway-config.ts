@@ -53,6 +53,8 @@ export type AccountDef = {
 export type SessionMode = "auto" | "pinned";
 
 export type SessionAssignment = {
+  /** Recorded at launch so following defaults cannot change the wire protocol. */
+  lane?: Lane;
   route: string | null;
   mode: SessionMode;
   /** Account whose login the client was launched with; null = launched with a dummy token. */
@@ -90,9 +92,9 @@ export function gatewayUrl(): string {
 
 export function accountCatalog(): AccountDef[] {
   return [
-    { id: "claude-personal", lane: "claude", label: "Claude personal", dir: process.env.CLAUDE_CONFIG_DIR || path.join(home, ".claude"), isDefaultHome: true },
+    { id: "claude-personal", lane: "claude", label: "Claude default account", dir: process.env.CLAUDE_CONFIG_DIR || path.join(home, ".claude"), isDefaultHome: true },
     { id: "claude-business", lane: "claude", label: "Claude business (Team/Enterprise)", dir: path.join(accountsDir, "claude-business"), isDefaultHome: false },
-    { id: "chatgpt-personal", lane: "codex", label: "ChatGPT personal", dir: process.env.CODEX_HOME || path.join(home, ".codex"), isDefaultHome: true },
+    { id: "chatgpt-personal", lane: "codex", label: "ChatGPT default account", dir: process.env.CODEX_HOME || path.join(home, ".codex"), isDefaultHome: true },
     { id: "chatgpt-business", lane: "codex", label: "ChatGPT business (Team)", dir: path.join(accountsDir, "chatgpt-business"), isDefaultHome: false }
   ];
 }
@@ -116,9 +118,9 @@ export function routeCatalog(env: NodeJS.ProcessEnv = process.env): RouteDef[] {
     {
       id: "claude-personal",
       lane: "claude",
-      label: "Claude personal",
+      label: "Claude default account",
       provider: "Anthropic (claude.ai subscription)",
-      description: "Forwards the session's own claude.ai login to api.anthropic.com. Usage counts against the personal plan.",
+      description: "Forwards the session's own claude.ai login to api.anthropic.com. Usage counts against whichever plan is signed in to the default account.",
       upstream: "https://api.anthropic.com",
       auth: { type: "passthrough" },
       account: "claude-personal",
@@ -130,7 +132,7 @@ export function routeCatalog(env: NodeJS.ProcessEnv = process.env): RouteDef[] {
       lane: "claude",
       label: "Claude business",
       provider: "Anthropic (Team/Enterprise subscription)",
-      description: "Same as personal but for a session launched with the business login.",
+      description: "Uses the separately stored business login for sessions launched with that account.",
       upstream: "https://api.anthropic.com",
       auth: { type: "passthrough" },
       account: "claude-business",
@@ -176,9 +178,9 @@ export function routeCatalog(env: NodeJS.ProcessEnv = process.env): RouteDef[] {
     {
       id: "chatgpt-personal",
       lane: "codex",
-      label: "ChatGPT personal",
+      label: "ChatGPT default account",
       provider: "OpenAI (ChatGPT subscription)",
-      description: "Forwards the session's own ChatGPT login to the Codex backend. Usage counts against the personal plan.",
+      description: "Forwards the session's own ChatGPT login to the Codex backend. Usage counts against whichever plan is signed in to the default account.",
       upstream: "https://chatgpt.com/backend-api/codex",
       auth: { type: "passthrough" },
       account: "chatgpt-personal",
@@ -190,7 +192,7 @@ export function routeCatalog(env: NodeJS.ProcessEnv = process.env): RouteDef[] {
       lane: "codex",
       label: "ChatGPT business",
       provider: "OpenAI (ChatGPT Team subscription)",
-      description: "Same as personal but for a session launched with the business login.",
+      description: "Uses the separately stored business login for sessions launched with that account.",
       upstream: "https://chatgpt.com/backend-api/codex",
       auth: { type: "passthrough" },
       account: "chatgpt-business",

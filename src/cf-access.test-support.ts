@@ -21,7 +21,8 @@ export interface FakeAccess {
 export interface SignOptions {
   issuer?: string;
   audience?: string | string[];
-  expiresIn?: string;
+  /** null deliberately omits exp for fail-closed verification tests. */
+  expiresIn?: string | null;
   notBefore?: string;
   kid?: string;
   /** Sign with a key that is not in the JWKS. */
@@ -61,8 +62,8 @@ export async function startFakeAccess(): Promise<FakeAccess> {
         .setProtectedHeader({ alg: "RS256", kid: options.kid ?? kid })
         .setIssuer(options.issuer ?? issuer)
         .setAudience(options.audience ?? audience)
-        .setIssuedAt()
-        .setExpirationTime(options.expiresIn ?? "5m");
+        .setIssuedAt();
+      if (options.expiresIn !== null) jwt = jwt.setExpirationTime(options.expiresIn ?? "5m");
       if (options.notBefore) jwt = jwt.setNotBefore(options.notBefore);
       return jwt.sign(signer);
     },
