@@ -1,6 +1,6 @@
 # Devy
 
-Tailscale-only operations agent for watching Claude Code and Codex tmux sessions, triaging Slack references, and delivering approved code changes as pull requests.
+Operations dashboard for Claude Code and Codex tmux sessions, provider routing, Slack triage, and approved code changes. Connect privately over Tailscale or through Cloudflare Access.
 
 This MVP intentionally has no browser login of its own. Tailscale is the access layer. Do not expose ports `8787`, `8790` or `8791` to the public internet. The one supported public path is a Cloudflare Tunnel in front of Cloudflare Access, described in [Public access via Cloudflare Tunnel + Access](#public-access-via-cloudflare-tunnel--access).
 
@@ -17,7 +17,7 @@ This MVP intentionally has no browser login of its own. Tailscale is the access 
 - Runs feasibility checks with Codex in a read-only sandbox; approved builds run in isolated git worktrees and stop at a review-ready pull request.
 - Optionally sends text input to any observed tmux session when `ENABLE_AGENT_INPUT=true`.
 - Exposes read APIs without login over Tailscale.
-- Requires `AGENT_OPS_TOKEN` for non-local writes to `POST /api/events`.
+- Uses Cloudflare Access for public reads and writes, and `AGENT_OPS_TOKEN` for non-local Tailscale writes.
 
 ## Setup
 
@@ -83,7 +83,7 @@ AGENT_WAIT_ALERT_SECONDS=30
 
 Use `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_CHANNEL_ID`, and `SLACK_SOCKET_MODE=true` for the better Slack flow: each alert is posted as a separate top-level message, and replies in that Slack thread are sent to the exact tmux session from the alert. This uses Slack Socket Mode, so no public inbound HTTP route is needed.
 
-`ENABLE_AGENT_INPUT=false` keeps browser-to-tmux input and stop actions disabled on the main dashboard. Set it to `true` only if you want the dashboard to type into and manage tmux sessions. The dashboard prompts once for `AGENT_OPS_TOKEN` and stores it in browser local storage for write requests.
+`ENABLE_AGENT_INPUT=false` keeps browser-to-tmux input and stop actions disabled on the main dashboard. Set it to `true` only if you want the dashboard to type into and manage tmux sessions. Cloudflare Access sign-in authorizes those controls directly. Over Tailscale, the dashboard prompts once for `AGENT_OPS_TOKEN` and stores it in browser local storage for write requests.
 
 `CLAUDE_TMUX_SESSION` and `CODEX_TMUX_SESSION` are still used by the legacy `/api/agents/:agent/input` endpoint. Discovery and Slack monitoring use `tmux list-sessions`, so session names like `claude-pilot` and `codex-app-a` are picked up automatically.
 
@@ -318,6 +318,22 @@ SLACK_BUILD_TIMEOUT_SECONDS=3600
 SLACK_CODEX_MODEL=
 ```
 
+## Provider gateway
+
+The loopback-only `agent-gateway` service listens on port 8791. Claude Code uses the Anthropic Messages protocol; Codex uses OpenAI Responses over HTTP streaming. Routes forward the client's request format and inject the selected API credential when needed. The gateway does not convert Claude conversations into Codex conversations.
+
+Use **Gateway** to inspect accounts, run a real provider probe, choose defaults, order fallback routes, and switch a gateway-managed session between compatible providers. **Auto** retries eligible routes on rate limits or upstream failures before any response bytes reach the client; **Pinned** preserves the selected route and returns its error. A stream that fails after output starts is reported as failed and is not replayed on another provider.
+
+New sessions default to an available gateway route. Select **Direct (no gateway)** explicitly to bypass it. Sessions already running outside the gateway cannot be redirected in place: create a routed session instead. Switching a subscription login also requires a new session, since the running CLI owns that login. Switching between API routes or from the launch subscription to an API route retains the same session.
+
+The default account directory may contain a personal or team login; its account detail shows the actual subscription. Additional logins have isolated directories under `~/.devy/accounts`. Missing logins are shown as unavailable. Azure requires `AZURE_OPENAI_BASE_URL`, `AZURE_OPENAI_API_KEY`, and `AZURE_OPENAI_DEPLOYMENT`; Bedrock Mantle routes require `AWS_BEARER_TOKEN_BEDROCK`. Environment values stay in `/etc/agent-ops.env`, never in the repository. Current CLI provider fields are documented in the [official Codex configuration reference](https://developers.openai.com/codex/config-reference/).
+
+Startup configuration is validated by `src/config.ts`; errors identify the variable to fix. `EVENT_RETENTION_DAYS` defaults to 90 for retained event/conversation history.
+
+Account sign-in opens a temporary `login-*` terminal. Successful login closes that helper and returns the dashboard to Gateway; credentials stay in the account directory. A failed login keeps its error visible in the terminal. Ordinary agent sessions retain their shell when the agent exits.
+
+For **Codex on Bedrock**, generate a Bedrock API key in the [AWS console](https://console.aws.amazon.com/bedrock/home?region=us-east-1) under **API keys**, then set `AWS_BEARER_TOKEN_BEDROCK`, `BEDROCK_REGION` (default `us-east-1`) and `BEDROCK_CODEX_MODEL` (default `openai.gpt-5.6-sol`) in `/etc/agent-ops.env`. The key needs permission for Mantle inference and bearer-token authentication. Restart `agent-gateway`, `agent-ops` and `agent-sessions`, test the route, and select **Codex on Bedrock** when creating a session. AWS bills this independently of a ChatGPT subscription. A pasted short-term key expires within 12 hours; this gateway does not yet refresh AWS credentials automatically. See [AWS key generation and refresh guidance](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html) and the [Bedrock Responses API](https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-mantle.html).
+
 ## Public access via Cloudflare Tunnel + Access
 
 Devy can be reached from a phone off the tailnet through a Cloudflare Tunnel, with Cloudflare Access doing the login. Nothing new is opened on the box: cloudflared makes an outbound connection to Cloudflare and forwards each public hostname to a loopback-only listener that Devy adds next to its tailnet ports.
@@ -327,12 +343,14 @@ Devy can be reached from a phone off the tailnet through a Cloudflare Tunnel, wi
 | `devy.mukilsenthil.com` | `http://localhost:8797` (`TUNNEL_PORT`) | dashboard (`agent-ops`) |
 | `sessions.devy.mukilsenthil.com` | `http://localhost:8798` (`MANAGER_TUNNEL_PORT`) | session manager (`agent-sessions`) |
 
+The session manager is also available at `https://devy.mukilsenthil.com/remote/`, under the main hostname's existing Access application and certificate. The separate nested hostname requires an edge certificate explicitly covering `sessions.devy.mukilsenthil.com`; the standard `*.mukilsenthil.com` certificate does not cover it. Use `/remote/` when that certificate is unavailable.
+
 How the origin treats those two listeners (`src/auth.ts`, `src/cf-access.ts`):
 
 - Every connection accepted on 8797/8798 is marked as a tunnel connection at the socket level. It is never treated as localhost, even though cloudflared connects from `127.0.0.1`, and `cf-*` headers are never trusted on their own.
-- Every request — `/api/health`, static files, API calls and the WebSocket terminal upgrade — is refused with `401` until the `Cf-Access-Jwt-Assertion` header carries a JWT that verifies against the team's JWKS (`https://<team>/cdn-cgi/access/certs`, cached, refetched on an unknown key id): RS256 signature, `aud` = `CF_ACCESS_AUD`, `iss` = `https://<team>`, `exp`/`nbf`, and an `email` claim in `CF_ACCESS_ALLOWED_EMAILS` (case-insensitive).
-- A verified caller gets tailnet privileges: reads work, writes still require `AGENT_OPS_TOKEN` as a Bearer token (the PWA asks once and keeps it in local storage). The Access login alone never authorises a write. Writes through the tunnel are also rate limited (120/minute per identity).
-- If `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD` or `CF_ACCESS_ALLOWED_EMAILS` is missing, the tunnel listeners refuse everything and the service logs a warning at startup. The tailnet listeners on 8787/8790 keep their `TAILSCALE_ONLY` behaviour unchanged.
+- Every request — `/api/health`, static files, API calls and the WebSocket terminal upgrade — is refused with `401` until the `Cf-Access-Jwt-Assertion` header carries a JWT that verifies against the team's JWKS (`https://<team>/cdn-cgi/access/certs`, cached, refetched on an unknown key id): RS256 signature, `aud` = `CF_ACCESS_AUD`, `iss` = `https://<team>`, required `exp`, and `nbf` when present. Cloudflare's Access policy determines who may enter. `CF_ACCESS_ALLOWED_EMAILS` is an optional additional local restriction; leave it blank to accept every identity Cloudflare authorizes for this application, including service identities without an email claim.
+- Cloudflare Access login authorizes reads and writes, including the terminal, without an additional `AGENT_OPS_TOKEN`. Browser writes and WebSocket upgrades must come from the same origin. Writes through the tunnel are rate limited (120/minute per identity). The separate Tailscale listeners still require the write token for non-local writes.
+- If `CF_ACCESS_TEAM_DOMAIN` or `CF_ACCESS_AUD` is missing, the tunnel listeners refuse everything and the service logs a warning at startup. The tailnet listeners on 8787/8790 keep their `TAILSCALE_ONLY` behaviour unchanged.
 
 ### Zero Trust dashboard
 
@@ -353,7 +371,8 @@ Add to `/etc/agent-ops.env` (values only there, never in the repo):
 CLOUDFLARE_TUNNEL_TOKEN=<token copied in step 1>
 CF_ACCESS_TEAM_DOMAIN=<team>.cloudflareaccess.com
 CF_ACCESS_AUD=<AUD tag copied in step 5>
-CF_ACCESS_ALLOWED_EMAILS=mukil@noso.so
+# Optional additional restriction; blank trusts Cloudflare's policy.
+CF_ACCESS_ALLOWED_EMAILS=
 # optional, these are the defaults
 TUNNEL_PORT=8797
 MANAGER_TUNNEL_PORT=8798
@@ -375,9 +394,13 @@ scripts/cloudflare-tunnel.sh start|stop|disable|logs
 2. Do the dashboard steps above and add the environment lines; restart `agent-ops` and `agent-sessions` again so they pick up `CF_ACCESS_*`.
 3. Confirm the origin fails closed before anything is public: `curl -i http://127.0.0.1:8797/api/health` must return `401` with `"cloudflare access required"`, and so must `curl -i -H 'cf-access-authenticated-user-email: mukil@noso.so' http://127.0.0.1:8797/`.
 4. `scripts/cloudflare-tunnel.sh enable`. The tunnel shows *Healthy* in Zero Trust → Networks → Tunnels within a minute.
-5. From a phone with Tailscale off, open `https://devy.mukilsenthil.com`: Cloudflare Access asks for the email and a one-time code, then the dashboard loads. Paste `AGENT_OPS_TOKEN` in *Settings* once to enable writes. An unauthenticated `curl -i https://devy.mukilsenthil.com/api/health` must answer with a `302` to the Access login page, never with `200`.
+5. From a phone with Tailscale off, open `https://devy.mukilsenthil.com`: Cloudflare Access asks for the email and a one-time code, then the dashboard and its controls work without another token. Open `/remote/` for the quick session manager. An unauthenticated `curl -i https://devy.mukilsenthil.com/api/health` must answer with a `302` to the Access login page, never with `200`.
 
 To take the public path down again: `scripts/cloudflare-tunnel.sh disable`. The tailnet listeners are unaffected either way.
+
+### A 502 after successful Access login
+
+The published application's **service type must be HTTP**, with URL `localhost:8797` (or `localhost:8798` for the separate manager). These loopback listeners do not speak TLS. Configuring `https://localhost:8797` produces a Cloudflare 502 and the connector logs `tls: first record does not look like a TLS handshake`. Change the tunnel route to HTTP and save it; Cloudflare still serves HTTPS to the browser. This dashboard-managed route update takes effect without restarting Devy.
 
 ## tmux Detection
 
@@ -432,6 +455,8 @@ Service details:
 - Start command: `npm run start`
 
 ## Acceptance Checks
+
+`npm run test:ui` checks the running dashboard's Gateway buttons, Cloudflare token-free settings, completed-login navigation and reply draft preservation at phone and desktop sizes. API writes and terminal sockets are intercepted. It defaults to `http://127.0.0.1:8787`; override with `DEVY_TEST_URL`, and set `DEVY_TEST_BROWSER` to a Chromium executable if Playwright's bundled browser is unavailable.
 
 ```bash
 cd /home/ubuntu/apps/devy
