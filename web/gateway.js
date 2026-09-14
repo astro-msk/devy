@@ -14,6 +14,7 @@
   let pollTimer = null;
   let busy = new Set();
   let wireController = null;
+  let defaultResult = null;
 
   async function load() {
     gw = await Gateway.state(true);
@@ -95,7 +96,7 @@
         </div>
         <div class="btn-row gw-actions">
           <button class="btn btn-sm" data-act="test" ${r.available ? "" : "disabled"}>Test</button>
-          <button class="btn btn-sm" data-act="default" ${r.isDefault || !r.available ? "disabled" : ""}>Make default</button>
+          <button class="btn btn-sm" data-act="default" ${busy.has("default") || !r.available ? "disabled" : ""}>${r.isDefault ? "Apply default again" : "Make default"}</button>
           <button class="btn btn-sm btn-ghost" data-act="toggle">${r.enabled ? "Disable" : "Enable"}</button>
           ${r.health.cooling || r.health.status === "error" ? `<button class="btn btn-sm btn-ghost" data-act="reset">Clear status</button>` : ""}
         </div>
@@ -158,6 +159,33 @@
     </tr>`;
   }
 
+  function codexStatusHTML(status) {
+    if (!status) return "";
+    const label = { connected: "Gateway connected", "restart-required": "Reconnect needed", unavailable: "Status unavailable", error: "Connection error" }[status.status] || "Status unavailable";
+    return `<section class="panel gw-desktop" aria-label="Codex desktop connection">
+      <div class="panel-pad">
+        <div class="gw-title"><b>Codex desktop</b><span class="tag ${status.status === "connected" ? "running" : "dirty"}">${label}</span></div>
+        <p class="gw-line">${escapeHtml(status.detail || "Connection status could not be confirmed.")}</p>
+        ${status.configuredProvider ? `<p class="gw-line muted">Configured provider: ${escapeHtml(status.configuredProvider)}</p>` : ""}
+        ${status.loadedDirectCount > 0 ? `<p class="gw-line warn">${status.loadedDirectCount} loaded ${status.loadedDirectCount === 1 ? "task still uses its" : "tasks still use their"} direct provider. Reconnect through the gateway to use these defaults.</p>` : ""}
+      </div>
+    </section>`;
+  }
+
+  function defaultResultHTML() {
+    if (!defaultResult) return "";
+    if (defaultResult.error) return `<div class="panel gw-bad" role="alert"><div class="panel-pad"><b>Default could not be changed</b><p class="gw-line bad">${escapeHtml(defaultResult.error)}</p></div></div>`;
+    const result = defaultResult.result;
+    const applied = Array.isArray(result.appliedSessions) ? result.appliedSessions : null;
+    const blocked = Array.isArray(result.blockedSessions) ? result.blockedSessions : [];
+    return `<div class="panel gw-ok" role="status"><div class="panel-pad">
+      <b>${escapeHtml(defaultResult.label)} is the default</b>
+      <p class="gw-line">${applied === null ? "Default saved. Session updates were not reported by the server." : applied.length ? `${applied.length} automatic ${applied.length === 1 ? "session will" : "sessions will"} follow this default on ${applied.length === 1 ? "its" : "their"} next request.` : "No existing automatic sessions were updated."}</p>
+      ${blocked.length ? `<p class="gw-line warn">${blocked.length} ${blocked.length === 1 ? "session kept its" : "sessions kept their"} current provider:</p><ul class="gw-result-list">${blocked.map((item) => `<li><b>${escapeHtml(item.session)}</b>: ${escapeHtml(item.reason)}</li>`).join("")}</ul>` : ""}
+      ${result.codexServer ? `<p class="gw-line ${result.codexServer.status === "connected" ? "muted" : "warn"}">Codex desktop: ${escapeHtml(result.codexServer.detail || "Check the desktop connection status.")}</p>` : ""}
+    </div></div>`;
+  }
+
   function render(root) {
     if (!gw.up) {
       root.innerHTML = `
@@ -176,6 +204,10 @@
           <p class="hero-sub">${escapeHtml(gw.url)}, up ${formatUptime(Math.round((st.now - st.startedAt) / 1000))}. ${ready} of ${st.routes.length} routes ready.</p>
           <label class="gw-auto"><span class="switch ${st.autoSwitch ? "on" : ""}" aria-hidden="true"></span><input type="checkbox" id="gw-auto" class="sr-only" ${st.autoSwitch ? "checked" : ""} /> Switch sessions automatically on rate limits and errors</label>
         </header>
+
+        <p class="gw-policy gw-line muted">Defaults apply to automatic gateway sessions on their next request. Pinned sessions keep their provider. Sessions using a provider directly need to reconnect through the gateway.</p>
+        ${codexStatusHTML(gw.codexServer)}
+        <div id="gw-default-result" aria-live="polite">${defaultResultHTML()}</div>
 
         <section class="group">
           <div class="group-head"><h2>Accounts</h2><span class="spacer"></span><span class="small muted">Signing in opens a terminal; finish the login there.</span></div>
@@ -224,6 +256,28 @@
     }
   }
 
+  async function changeDefault(root, provider) {
+    if (busy.has("default")) return;
+    busy.add("default");
+    root.querySelectorAll('[data-act="default"]').forEach((button) => { button.disabled = true; });
+    const button = root.querySelector(`.gw-route[data-route="${provider.id}"] [data-act="default"]`);
+    if (button) button.textContent = "Applying…";
+    defaultResult = null;
+    $("#gw-default-result", root).innerHTML = "";
+    try {
+      const result = await api("/api/gateway/settings", { method: "PUT", body: JSON.stringify({ defaults: { [provider.lane]: provider.id } }) });
+      defaultResult = { label: provider.label, result };
+      toast(`${provider.label} default saved`, "ok");
+    } catch (error) {
+      defaultResult = { error: error.message };
+      toast(`Default change failed: ${error.message}`, "error");
+    } finally {
+      busy.delete("default");
+      await refresh(root);
+      $("#gw-default-result", root)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }
+
   function wire(root) {
     wireController?.abort();
     wireController = new AbortController();
@@ -245,7 +299,7 @@
         const lane = gw.state.order[r.lane];
         const idx = lane.indexOf(id);
         if (actName === "toggle") return act(root, `toggle ${id}`, () => api(`/api/gateway/routes/${id}`, { method: "PUT", body: JSON.stringify({ enabled: !r.enabled }) }));
-        if (actName === "default") return act(root, `default ${id}`, () => api("/api/gateway/settings", { method: "PUT", body: JSON.stringify({ defaults: { [r.lane]: id } }) }));
+        if (actName === "default") return changeDefault(root, r);
         if (actName === "reset") return act(root, `reset ${id}`, () => api(`/api/gateway/routes/${id}/reset`, { method: "POST" }));
         if (actName === "up" || actName === "down") {
           const position = actName === "up" ? idx - 1 : idx + 1;

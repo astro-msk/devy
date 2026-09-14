@@ -3,6 +3,7 @@
 // Code or Codex session at the gateway, and run connectivity probes with the
 // real clients.
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { access, copyFile, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -147,6 +148,7 @@ export async function launchSpec(lane: Lane, session: string, route: RouteDef, a
     if (!account) throw new Error(`route ${route.id} has no login account`);
   } else if (accountId) {
     account = findAccount(accountId);
+    if (!account) throw new Error(`unknown login account: ${accountId}`);
   } else {
     const fallback = findAccount(lane === "claude" ? "claude-personal" : "chatgpt-personal")!;
     account = (await accountStatus(fallback)).signedIn ? fallback : null;
@@ -162,15 +164,17 @@ export async function launchSpec(lane: Lane, session: string, route: RouteDef, a
     // can't shadow the account login (the gateway injects real keys itself).
     const env: Record<string, string> = {
       ANTHROPIC_BASE_URL: base, ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "",
+      CLAUDE_CODE_OAUTH_TOKEN: "", CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: "",
+      CLAUDE_CONFIG_DIR: (account ?? findAccount("claude-personal")!).dir,
       CLAUDE_CODE_USE_BEDROCK: "0", CLAUDE_CODE_USE_VERTEX: "0", CLAUDE_CODE_USE_FOUNDRY: "0"
     };
-    if (account && !account.isDefaultHome) env.CLAUDE_CONFIG_DIR = account.dir;
     if (!account) env.ANTHROPIC_AUTH_TOKEN = "devy-gateway";
     return { env, args: [], account: account?.id ?? null };
   }
 
-  const env: Record<string, string> = { OPENAI_API_KEY: "" };
-  if (account && !account.isDefaultHome) env.CODEX_HOME = account.dir;
+  // tmux's server environment and login shell can differ from the dashboard's
+  // environment. Pin even the default home so the checked login is the one used.
+  const env: Record<string, string> = { OPENAI_API_KEY: "", CODEX_HOME: (account ?? findAccount("chatgpt-personal")!).dir };
   const args = [
     "-c", "model_provider=devy",
     "-c", 'model_providers.devy.name="Devy gateway"',
@@ -209,11 +213,10 @@ export function launchCommand(agent: Lane, spec: LaunchSpec | null): string {
 export async function loginCommand(account: AccountDef): Promise<string> {
   await prepareAccountDir(account);
   if (account.lane === "claude") {
-    const env = account.isDefaultHome ? "" : `env CLAUDE_CONFIG_DIR=${shellQuote(account.dir)} `;
-    return `${env}claude auth login`;
+    const unset = ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"];
+    return `env ${unset.map((name) => `-u ${name}`).join(" ")} CLAUDE_CONFIG_DIR=${shellQuote(account.dir)} claude auth login`;
   }
-  const env = account.isDefaultHome ? "" : `env CODEX_HOME=${shellQuote(account.dir)} `;
-  return `${env}codex login --device-auth`;
+  return `env -u OPENAI_API_KEY -u OPENAI_BASE_URL CODEX_HOME=${shellQuote(account.dir)} codex login --device-auth`;
 }
 
 export async function signOut(account: AccountDef): Promise<void> {
@@ -248,7 +251,9 @@ export async function probeRoute(route: RouteDef): Promise<ProbeResult> {
     return { ok: direct.ok, via: "gateway", ms: direct.ms ?? Date.now() - started, status: direct.status, model: direct.model, output: direct.ok ? "OK" : "", error: direct.error };
   }
 
-  const session = `${PROBE_PREFIX}${route.id}`;
+  // Two callers can test the same account at once. Each probe must own its
+  // assignment so finishing one cannot remove the other's selected route.
+  const session = `${PROBE_PREFIX}${route.id}-${randomUUID()}`;
   const spec = await launchSpec(route.lane, session, route);
   await gatewayRequest("PUT", `/sessions/${session}`, { route: route.id, mode: "pinned", account: spec.account });
   // The dashboard runs under systemd with provider keys in its environment

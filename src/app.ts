@@ -19,6 +19,7 @@ import {
   searchMemories
 } from "./ai-memory.js";
 import { assertValidConfig } from "./config.js";
+import { codexServerStatus, connectCodexGateway } from "./codex-gateway.js";
 import { getRecentEvents } from "./db.js";
 import { findAccount, gatewayUrl } from "./gateway-config.js";
 import type { Gateway } from "./gateway-core.js";
@@ -302,7 +303,8 @@ export function createApp(options: { webDir?: string } = {}): Express {
   // ── Gateway: routes, accounts, per-session switching ─────────────────────
   app.get("/api/gateway/state", async (_req, res) => {
     const [gateway, accounts, sessions] = await Promise.all([gatewayState(), accountStatuses(), listManagedSessions()]);
-    res.json({ ...gateway, url: gatewayUrl(), accounts, sessions: sessions.map((s) => ({ name: s.name, agent: s.agent, state: s.state })) });
+    const codexServer = await codexServerStatus(gateway.state?.log);
+    res.json({ ...gateway, url: gatewayUrl(), accounts, codexServer, sessions: sessions.map((s) => ({ name: s.name, agent: s.agent, state: s.state })) });
   });
 
   const gatewayWrite = async (req: express.Request, res: express.Response, run: () => Promise<unknown>) => {
@@ -314,7 +316,31 @@ export function createApp(options: { webDir?: string } = {}): Express {
   };
 
   app.put("/api/gateway/settings", requireWriteAuth, (req, res) =>
-    gatewayWrite(req, res, () => gatewayRequest("PUT", "/settings", req.body)));
+    gatewayWrite(req, res, async () => {
+      const patch = z.object({
+        autoSwitch: z.boolean().optional(),
+        defaults: z.object({ claude: routeIdSchema.nullable().optional(), codex: routeIdSchema.nullable().optional() }).strict().optional()
+      }).strict().parse(req.body);
+      const accounts = await accountStatuses();
+      for (const id of Object.values(patch.defaults ?? {})) {
+        if (!id) continue;
+        const route = findRoute(id);
+        if (route?.account && !accounts.some((account) => account.id === route.account && account.signedIn)) {
+          throw new Error("Sign in to this account before selecting it as the default");
+        }
+      }
+      const result = await gatewayRequest<{ appliedSessions: string[]; blockedSessions: { session: string; reason: string }[] }>("PUT", "/settings", patch);
+      const live = await listManagedSessions();
+      const state = await gatewayRequest<GatewayView>("GET", "/state");
+      for (const session of live) {
+        if ((session.agent === "claude" || session.agent === "codex") && patch.defaults?.[session.agent] !== undefined && !state.assignments[session.name]) {
+          result.blockedSessions.push({ session: session.name, reason: "Started outside the gateway; reconnect through Devy" });
+        }
+      }
+      const route = patch.defaults?.codex ? findRoute(patch.defaults.codex) : null;
+      const codexServer = route ? await connectCodexGateway(route.account ?? null) : undefined;
+      return { ...result, ...(codexServer ? { codexServer } : {}) };
+    }));
 
   app.put("/api/gateway/routes/:route", requireWriteAuth, (req, res) =>
     gatewayWrite(req, res, () => gatewayRequest("PUT", `/routes/${routeIdSchema.parse(req.params.route)}`, req.body)));

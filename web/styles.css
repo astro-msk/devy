@@ -532,6 +532,9 @@ label > input, label > select, label > textarea { font-weight: 400; color: var(-
 /* ─── Gateway ─────────────────────────────────────────────────────────── */
 .gw-head { display: flex; align-items: center; gap: var(--s-4); flex-wrap: wrap; margin-bottom: var(--s-4); }
 .gw-head .sub { color: var(--fg-3); font-size: var(--t-12); }
+.gw-policy, .gw-desktop, #gw-default-result:not(:empty) { margin-bottom: var(--s-4); }
+.gw-desktop .panel-pad, #gw-default-result .panel-pad { display: grid; gap: 8px; }
+.gw-result-list { margin: 0; padding-left: 20px; font-size: var(--t-12); overflow-wrap: anywhere; }
 .gw-auto { margin-left: auto; display: inline-flex; flex-direction: row; align-items: center; gap: 10px; min-height: 44px; font-size: var(--t-14); color: var(--fg); cursor: pointer; }
 .gw-auto:has(input:focus-visible) .switch { outline: 2px solid var(--focus); outline-offset: 3px; }
 .gw-accounts { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: var(--s-3); }

@@ -1,7 +1,7 @@
 // Devy service worker — versioned app-shell cache.
 // Bump VERSION whenever a shell asset changes; the page shows an "update
 // available" toast and the new worker takes over only when the user reloads.
-const VERSION = "devy-v24";
+const VERSION = "devy-v25";
 const SHELL = `${VERSION}-shell`;
 const RUNTIME = `${VERSION}-runtime`;
 const SHELL_ASSETS = [
