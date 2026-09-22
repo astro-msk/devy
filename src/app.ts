@@ -19,15 +19,17 @@ import {
   searchMemories
 } from "./ai-memory.js";
 import { assertValidConfig } from "./config.js";
-import { codexServerStatus, connectCodexGateway } from "./codex-gateway.js";
+import { codexServerStatus, connectCodexGateway, restartCodexServer } from "./codex-gateway.js";
 import { getRecentEvents } from "./db.js";
 import { findAccount, gatewayUrl } from "./gateway-config.js";
+import { adoptDirectSessions, relaunchSession } from "./failover.js";
 import type { Gateway } from "./gateway-core.js";
 import {
   accountStatuses,
   findRoute,
   gatewayRequest,
   gatewayState,
+  ensureClaudeOnboarded,
   launchCommand,
   launchSpec,
   loginCommand,
@@ -284,6 +286,8 @@ export function createApp(options: { webDir?: string } = {}): Express {
         const route = findRoute(routeId);
         if (!route || route.lane !== agent) throw new Error(`unknown ${agent} route: ${routeId}`);
         spec = await launchSpec(agent, name, route);
+        // A secondary account dir must not greet the new session with the setup wizard.
+        if (agent === "claude" && spec.env.CLAUDE_CONFIG_DIR) await ensureClaudeOnboarded(spec.env.CLAUDE_CONFIG_DIR, directory);
         launch = launchCommand(agent, spec);
         // Register before launch so the first request already resolves to the chosen route.
         await gatewayRequest("PUT", `/sessions/${name}`, { route: route.id, mode: "auto", account: spec.account });
@@ -373,6 +377,21 @@ export function createApp(options: { webDir?: string } = {}): Express {
   app.delete("/api/gateway/sessions/:session", requireWriteAuth, (req, res) =>
     gatewayWrite(req, res, () => updateSessionRoute(req, true)));
 
+  // Move every session still talking to its provider directly onto the gateway.
+  app.post("/api/gateway/adopt", requireWriteAuth, (req, res) =>
+    gatewayWrite(req, res, async () => {
+      const body = z.object({ sessions: z.array(sessionNameSchema).max(50).optional(), onlyIdle: z.boolean().optional() }).strict().parse(req.body ?? {});
+      const results = await adoptDirectSessions({ sessions: body.sessions, onlyIdle: body.onlyIdle ?? false, source: "dashboard" });
+      return { ok: true, results };
+    }));
+
+  app.post("/api/gateway/codex-server/restart", requireWriteAuth, (req, res) =>
+    gatewayWrite(req, res, async () => {
+      const result = await restartCodexServer();
+      await recordEvent({ agent: "codex", type: "info", message: result.restarted ? `Codex desktop server restarted (${result.restarted} process${result.restarted === 1 ? "" : "es"}); the desktop reconnects on its own.` : "Codex desktop server restart requested, but no app-server daemon was running; the desktop starts one on demand." }).catch(() => {});
+      return { ok: true, ...result };
+    }));
+
   app.post("/api/gateway/accounts/:account/login", requireWriteAuth, (req, res) =>
     gatewayWrite(req, res, async () => {
       const account = findAccount(accountIdSchema.parse(req.params.account));
@@ -425,6 +444,19 @@ export function createApp(options: { webDir?: string } = {}): Express {
       const result = await tmux(["send-keys", "-t", sessionName, tmuxKey(parsed.data.key)]);
       if (result.code !== 0) throw new Error(result.stderr || "tmux send-keys failed");
       res.status(201).json({ ok: true });
+    } catch (error) {
+      res.status(400).json({ ok: false, error: (error as Error).message });
+    }
+  });
+
+  // Move a live session to another provider account: stop the CLI, relaunch it
+  // in the same pane through the gateway on `route`, resume its conversation.
+  app.post("/api/sessions/:session/relaunch", requireWriteAuth, async (req, res) => {
+    try {
+      const session = sessionNameSchema.parse(req.params.session);
+      const { route } = z.object({ route: routeIdSchema.optional() }).strict().parse(req.body ?? {});
+      const result = await relaunchSession(session, route ?? null, route ? "switched from the dashboard" : "restarted from the dashboard", { source: "dashboard" });
+      res.json({ ok: true, ...result });
     } catch (error) {
       res.status(400).json({ ok: false, error: (error as Error).message });
     }

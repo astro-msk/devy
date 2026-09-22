@@ -140,7 +140,7 @@
           <select data-act="route" aria-label="Route for ${escapeHtml(s.name)}" ${lane ? "" : "disabled"}>${options}</select>
           <label class="gw-check"><input type="checkbox" data-act="mode" ${a.mode === "auto" ? "checked" : ""} /> auto-switch</label>
           <span class="gw-line muted">${a.account ? `Signed in as ${escapeHtml(a.account)}` : "No login — API-key routes only"}</span>
-        ` : `<span class="gw-line muted">Not via the gateway — it was started outside Devy or before the gateway existed. Recreate it to route.</span>`}
+        ` : `<span class="gw-line muted">Not via the gateway — using its own login directly. Open its provider chip on Sessions to move it (restarts &amp; resumes), or wait: it is moved automatically when that login hits its limit.</span>`}
       </div>`;
   }
 
@@ -164,7 +164,7 @@
     const label = { connected: "Gateway connected", "restart-required": "Reconnect needed", unavailable: "Status unavailable", error: "Connection error" }[status.status] || "Status unavailable";
     return `<section class="panel gw-desktop" aria-label="Codex desktop connection">
       <div class="panel-pad">
-        <div class="gw-title"><b>Codex desktop</b><span class="tag ${status.status === "connected" ? "running" : "dirty"}">${label}</span></div>
+        <div class="gw-title"><b>Codex desktop</b><span class="tag ${status.status === "connected" ? "running" : "dirty"}">${label}</span><span class="spacer"></span><button class="btn btn-sm" data-act="codex-restart" title="Send SIGINT to the codex app-server daemon; the desktop respawns it and threads reload their provider">Restart Codex server</button></div>
         <p class="gw-line">${escapeHtml(status.detail || "Connection status could not be confirmed.")}</p>
         ${status.configuredProvider ? `<p class="gw-line muted">Configured provider: ${escapeHtml(status.configuredProvider)}</p>` : ""}
         ${status.loadedDirectCount > 0 ? `<p class="gw-line warn">${status.loadedDirectCount} loaded ${status.loadedDirectCount === 1 ? "task still uses its" : "tasks still use their"} direct provider. Reconnect through the gateway to use these defaults.</p>` : ""}
@@ -186,6 +186,52 @@
     </div></div>`;
   }
 
+  function ago(ts) {
+    const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+    if (s < 60) return `${s}s ago`;
+    if (s < 3600) return `${Math.round(s / 60)}m ago`;
+    return `${(s / 3600).toFixed(1)}h ago`;
+  }
+
+  // "Active now": per lane, the provider new and automatic sessions use, which
+  // live sessions sit on which provider, and the last real request that went out.
+  function directCount(st) {
+    return gw.sessions.filter((s) => (s.agent === "claude" || s.agent === "codex") && !s.name.startsWith("login-") && !st.assignments[s.name]).length;
+  }
+
+  function activeNowHTML(st) {
+    return `<section class="group gw-now" aria-label="Active providers">
+      <div class="group-head"><h2>Active now</h2><span class="spacer"></span>${directCount(st) ? `<button class="btn btn-sm" data-act="adopt" title="Restart each direct session through the gateway on its own login and resume its conversation">Move ${directCount(st)} direct onto gateway</button>` : `<span class="small muted">everything runs through the gateway</span>`}</div>
+      <div class="gw-now-grid">${LANES.map((lane) => {
+        const def = st.routes.find((r) => r.id === st.defaults[lane.id]) || null;
+        const sessions = gw.sessions.filter((s) => s.agent === lane.id && !s.name.startsWith("login-"));
+        const byRoute = new Map();
+        for (const s of sessions) {
+          const a = st.assignments[s.name];
+          const key = a ? (a.route || st.defaults[lane.id] || "—") : "direct";
+          if (!byRoute.has(key)) byRoute.set(key, []);
+          byRoute.get(key).push(s);
+        }
+        const groups = [...byRoute.entries()].sort((x, y) => (x[0] === "direct") - (y[0] === "direct") || y[1].length - x[1].length).map(([key, list]) => {
+          const r = st.routes.find((item) => item.id === key);
+          const label = key === "direct" ? "direct, own login" : r ? r.label : key;
+          const dot = key === "direct" ? "" : routeHealth(r);
+          return `<li><span class="rdot ${dot}"></span><b>${escapeHtml(label)}</b><span class="gw-now-sess mono">${list.map((s) => escapeHtml(s.name)).join(", ")}</span></li>`;
+        }).join("");
+        const last = st.log.find((e) => e.lane === lane.id && !e.session.startsWith("probe-") && e.outcome !== "cancelled");
+        const lastLine = last
+          ? `Last request ${ago(last.at)} via <b>${escapeHtml(st.routes.find((r) => r.id === last.route)?.label || last.route)}</b>${last.status >= 400 ? ` <span class="bad">· ${last.status === 429 ? "rate limited" : `HTTP ${last.status}`}</span>` : ""}`
+          : "No requests through the gateway yet.";
+        return `<div class="gw-now-lane">
+          <div class="gw-title"><span class="tag ${lane.id}">${lane.label}</span>${def ? `<b>${escapeHtml(def.label)}</b>${healthTag(def)}` : `<b class="muted">no default provider</b>`}</div>
+          <p class="gw-line muted">${def ? `Default: new and automatic sessions use this${def.account ? `, signed in as ${escapeHtml(def.account)}` : ""}.` : "Pick one with “Make default” below."}</p>
+          ${groups ? `<ul class="gw-now-list">${groups}</ul>` : `<p class="gw-line muted">No ${lane.label} sessions running.</p>`}
+          <p class="gw-line">${lastLine}</p>
+        </div>`;
+      }).join("")}</div>
+    </section>`;
+  }
+
   function render(root) {
     if (!gw.up) {
       root.innerHTML = `
@@ -205,7 +251,7 @@
           <label class="gw-auto"><span class="switch ${st.autoSwitch ? "on" : ""}" aria-hidden="true"></span><input type="checkbox" id="gw-auto" class="sr-only" ${st.autoSwitch ? "checked" : ""} /> Switch sessions automatically on rate limits and errors</label>
         </header>
 
-        <p class="gw-policy gw-line muted">Defaults apply to automatic gateway sessions on their next request. Pinned sessions keep their provider. Sessions using a provider directly need to reconnect through the gateway.</p>
+        <p class="gw-policy gw-line muted"><a href="#routing">Routing</a> shows which provider each lane and session is on and lets you switch or restart sessions. Defaults apply to automatic gateway sessions on their next request. Pinned sessions keep their provider. When a login hits its usage limit, Devy fails over inside the gateway or restarts the session on the next signed-in account and resumes its conversation; sessions running directly are moved onto the gateway the same way.</p>
         ${codexStatusHTML(gw.codexServer)}
         <div id="gw-default-result" aria-live="polite">${defaultResultHTML()}</div>
 
@@ -243,12 +289,13 @@
     wire(root);
   }
 
-  async function act(root, label, fn) {
+  async function act(root, label, fn, rerender = null) {
     if (busy.has(label)) return;
     busy.add(label);
     try {
       await fn();
-      await refresh(root);
+      if (rerender) { await load(); if (document.body.contains(root)) rerender(root); }
+      else await refresh(root);
     } catch (error) {
       toast(`${label}: ${error.message}`, "error");
     } finally {
@@ -293,6 +340,7 @@
       const routeEl = btn.closest(".gw-route[data-route]");
       const acctEl = btn.closest(".gw-account[data-account]");
       const actName = btn.dataset.act;
+      if (actName === "adopt" || actName === "codex-restart") return handleSharedAction(root, actName);
       if (routeEl) {
         const id = routeEl.dataset.route;
         const r = gw.state.routes.find((x) => x.id === id);
@@ -379,6 +427,157 @@
       box.innerHTML = keep;
     }
   }
+
+  async function handleSharedAction(root, actName, rerender = null) {
+    if (actName === "adopt") {
+      const n = directCount(gw.state);
+      const ok = await confirmDialog({ title: `Move ${n} direct ${n === 1 ? "session" : "sessions"} onto the gateway?`, body: "Each CLI is stopped and relaunched in its tmux window through the gateway on the login it already uses, with its conversation resumed. A turn in progress is interrupted.", action: "Move & resume" });
+      if (!ok) return;
+      return act(root, "adopt", async () => {
+        const res = await api("/api/gateway/adopt", { method: "POST", body: JSON.stringify({}) });
+        const moved = res.results.filter((r) => r.ok).length;
+        const failed = res.results.filter((r) => !r.ok && r.error);
+        Gateway.invalidate();
+        toast(`${moved} moved onto the gateway${failed.length ? `, ${failed.length} failed: ${failed.map((r) => `${r.session} (${r.error})`).join("; ")}` : ""}`, failed.length ? "error" : "ok", { duration: 8000 });
+      }, rerender);
+    }
+    if (actName === "codex-restart") {
+      const ok = await confirmDialog({ title: "Restart the Codex desktop server?", body: "The app-server daemon behind the Codex desktop app is interrupted; the desktop reconnects and reloads threads with the current provider. Nothing is lost on disk.", action: "Restart" });
+      if (!ok) return;
+      return act(root, "codex-restart", async () => {
+        const res = await api("/api/gateway/codex-server/restart", { method: "POST" });
+        toast(res.restarted ? `Codex server restarted (${res.restarted})` : "No Codex app-server daemon was running; the desktop starts it on demand", "ok", { duration: 6000 });
+      }, rerender);
+    }
+  }
+
+  // ── Routing page: per-session provider, switch or restart ────────────────
+  function routingSessionRow(s) {
+    const st = gw.state;
+    const lane = s.agent === "claude" || s.agent === "codex" ? s.agent : null;
+    if (!lane) return "";
+    const a = st.assignments[s.name] || null;
+    const currentId = a ? (a.route || st.defaults[lane]) : null;
+    const current = currentId ? st.routes.find((r) => r.id === currentId) : null;
+    const options = st.order[lane].map((id) => st.routes.find((r) => r.id === id)).filter(Boolean).map((r) => {
+      const signedIn = !r.account || Boolean(Gateway.account(r.account)?.signedIn);
+      const usable = r.available && r.enabled !== false && signedIn;
+      const live = a ? Gateway.eligible(r, a) : false;
+      const relaunch = usable && !live;
+      return `<option value="${r.id}" data-relaunch="${relaunch ? 1 : 0}" ${r.id === currentId ? "selected" : ""} ${usable ? "" : "disabled"}>${escapeHtml(r.label)}${!usable ? " (unavailable)" : relaunch ? " — restart" : ""}</option>`;
+    }).join("");
+    const status = a
+      ? `<span class="rdot ${routeHealth(current)}"></span>${escapeHtml(current?.label || currentId || "—")}<span class="muted"> · ${a.mode === "auto" ? "auto-switch" : "pinned"}${a.account ? ` · ${escapeHtml(a.account)}` : ""}</span>`
+      : `<span class="rdot"></span><span class="warn">Not via the gateway</span><span class="muted"> · own login, cannot fail over</span>`;
+    return `
+      <div class="gw-session rt-session" data-session="${escapeHtml(s.name)}" data-lane="${lane}">
+        <div class="gw-session-name">
+          <b>${escapeHtml(s.name)}</b>
+          <span class="tag ${s.agent}">${escapeHtml(s.agent)}</span>
+          <span class="tag ${s.state}">${stateLabels[s.state] || s.state}</span>
+        </div>
+        <span class="gw-line rt-status">${status}</span>
+        <div class="rt-actions">
+          <select data-act="route" aria-label="Provider for ${escapeHtml(s.name)}">${a ? "" : `<option value="" selected disabled>Move onto the gateway…</option>`}${options}</select>
+          ${a ? `<label class="gw-check"><input type="checkbox" data-act="mode" ${a.mode === "auto" ? "checked" : ""} /> auto</label>` : ""}
+          <button class="btn btn-sm btn-ghost" data-act="restart" title="Relaunch the CLI in its tmux window through the gateway and resume its conversation">Restart</button>
+          <a class="btn btn-sm btn-ghost" href="#terminal/${encodeURIComponent(s.name)}">Terminal</a>
+        </div>
+      </div>`;
+  }
+
+  function renderRouting(root) {
+    if (!gw.up) {
+      root.innerHTML = `<div class="wrap"><header class="hero"><h1>Routing</h1></header><div class="empty"><h3>The gateway is offline</h3><p>${escapeHtml(gw.error || "")} Start it with <code>sudo systemctl start agent-gateway</code>.</p></div></div>`;
+      return;
+    }
+    const st = gw.state;
+    const sessions = gw.sessions.filter((s) => (s.agent === "claude" || s.agent === "codex") && !s.name.startsWith("login-"));
+    root.innerHTML = `
+      <div class="wrap">
+        <header class="hero gw-head">
+          <h1>Routing</h1>
+          <p class="hero-sub">Which provider answers each lane and each session. Pick a provider to switch; options marked <b>restart</b> relaunch the CLI in place and resume its conversation.</p>
+          <label class="gw-auto"><span class="switch ${st.autoSwitch ? "on" : ""}" aria-hidden="true"></span><input type="checkbox" id="gw-auto" class="sr-only" ${st.autoSwitch ? "checked" : ""} /> Fail over automatically on usage limits and errors</label>
+        </header>
+        ${activeNowHTML(st)}
+        ${codexStatusHTML(gw.codexServer)}
+        <section class="group">
+          <div class="group-head"><h2>Sessions</h2><span class="count">${sessions.length}</span><span class="spacer"></span><a class="small" href="#gateway">Accounts &amp; route order →</a></div>
+          <div class="list">${sessions.length ? sessions.map(routingSessionRow).join("") : `<div class="empty compact"><p>No Claude Code or Codex sessions running.</p></div>`}</div>
+        </section>
+      </div>`;
+    wireRouting(root);
+  }
+
+  function wireRouting(root) {
+    wireController?.abort();
+    wireController = new AbortController();
+    const listenerOptions = { signal: wireController.signal };
+    $("#gw-auto", root).addEventListener("change", (e) => {
+      $(".gw-auto .switch", root)?.classList.toggle("on", e.target.checked);
+      act(root, "auto-switch", () => api("/api/gateway/settings", { method: "PUT", body: JSON.stringify({ autoSwitch: e.target.checked }) }), renderRouting);
+    }, listenerOptions);
+    root.addEventListener("click", async (e) => {
+      const btn = e.target.closest("button[data-act]");
+      if (!btn) return;
+      const row = btn.closest("[data-session]");
+      const actName = btn.dataset.act;
+      if (actName === "adopt" || actName === "codex-restart") return handleSharedAction(root, actName, renderRouting);
+      if (actName === "restart" && row) {
+        const session = row.dataset.session;
+        const ok = await confirmDialog({ title: `Restart ${session}?`, body: "The CLI is stopped and relaunched in the same tmux window through the gateway, with its conversation resumed. A turn in progress is interrupted.", action: "Restart & resume" });
+        if (!ok) return;
+        return act(root, `restart ${session}`, async () => {
+          const res = await api(`/api/sessions/${encodeURIComponent(session)}/relaunch`, { method: "POST", body: JSON.stringify({}) });
+          Gateway.invalidate();
+          toast(`${session} restarted${res.conversationId ? ", conversation resumed" : ""}`, "ok", { duration: 6000 });
+        }, renderRouting);
+      }
+    }, listenerOptions);
+    root.addEventListener("change", async (e) => {
+      const el = e.target.closest("[data-act]");
+      const row = e.target.closest("[data-session]");
+      if (!el || !row) return;
+      const session = row.dataset.session;
+      if (el.dataset.act === "route") {
+        const opt = el.options[el.selectedIndex];
+        const r = gw.state.routes.find((x) => x.id === el.value);
+        if (!r) return;
+        if (opt.dataset.relaunch === "1") {
+          const ok = await confirmDialog({ title: `Restart ${session} on ${r.label}?`, body: "The CLI is stopped and relaunched in the same tmux window through the gateway on this provider, with its conversation resumed. A turn in progress is interrupted.", action: "Restart & resume" });
+          if (!ok) { renderRouting(root); return; }
+          return act(root, `switch ${session}`, async () => {
+            const res = await api(`/api/sessions/${encodeURIComponent(session)}/relaunch`, { method: "POST", body: JSON.stringify({ route: r.id }) });
+            Gateway.invalidate();
+            toast(`${session} restarted on ${r.label}${res.conversationId ? ", conversation resumed" : ""}`, "ok", { duration: 6000 });
+          }, renderRouting);
+        }
+        return act(root, `switch ${session}`, async () => {
+          await Gateway.switchRoute(session, r.id);
+          toast(`${session} → ${r.label} on its next request`, "ok", { duration: 5000 });
+        }, renderRouting);
+      }
+      if (el.dataset.act === "mode") act(root, `mode ${session}`, () => Gateway.setMode(session, el.checked ? "auto" : "pinned"), renderRouting);
+    }, listenerOptions);
+  }
+
+  route("routing", {
+    title: "Routing",
+    skeleton: () => `<div class="wrap"><div class="skeleton sk-line" style="width:30%;height:28px"></div><div class="skeleton sk-line" style="width:55%"></div>${[1, 2, 3].map(() => `<div class="skeleton sk-row" style="height:88px;margin-top:10px"></div>`).join("")}</div>`,
+    async render(root) {
+      clearInterval(pollTimer);
+      await load();
+      renderRouting(root);
+      pollTimer = setInterval(() => {
+        if (document.hidden || currentRoute().name !== "routing" || busy.size) return;
+        if (document.activeElement?.tagName === "SELECT" && root.contains(document.activeElement)) return;
+        load().then(() => { if (currentRoute().name === "routing" && document.body.contains(root)) renderRouting(root); }).catch(() => {});
+      }, 6000);
+    },
+    leave() { clearInterval(pollTimer); wireController?.abort(); }
+  });
+  if (location.hash.startsWith("#routing")) navigate();
 
   route("gateway", {
     title: "Gateway",

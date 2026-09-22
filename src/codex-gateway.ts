@@ -1,6 +1,6 @@
 // Codex keeps a provider snapshot in each loaded task. A stable gateway URL
 // makes future provider changes effective without editing those snapshots.
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { chmod, copyFile, readFile } from "node:fs/promises";
 import path from "node:path";
@@ -119,4 +119,32 @@ export function connectCodexGateway(routeAccount: string | null): Promise<CodexS
   configuring = next;
   void next.finally(() => { if (configuring === next) configuring = null; });
   return next;
+}
+
+
+/**
+ * Restart the Codex desktop app-server daemon (`codex app-server --listen`),
+ * which pins provider settings per thread in memory. It only exits on SIGINT;
+ * the desktop's ssh proxy respawns it, and threads reload from disk.
+ */
+export function restartCodexServer(): Promise<{ restarted: number; pids: number[] }> {
+  return new Promise((resolve) => {
+    execFile("pgrep", ["-af", "codex app-server"], { timeout: 3000 }, (error, stdout) => {
+      const pids = (stdout || "")
+        .split("\n")
+        .filter((line) => /\bcodex app-server\b/.test(line) && !/\bproxy\b/.test(line) && !/pgrep/.test(line))
+        .map((line) => Number(line.trim().split(/\s+/)[0]))
+        .filter((pid) => Number.isInteger(pid) && pid > 0);
+      let restarted = 0;
+      for (const pid of pids) {
+        try {
+          process.kill(pid, "SIGINT");
+          restarted += 1;
+        } catch {
+          /* already gone */
+        }
+      }
+      resolve({ restarted, pids });
+    });
+  });
 }

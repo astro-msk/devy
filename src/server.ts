@@ -2,6 +2,7 @@ import "dotenv/config";
 import { createServer } from "node:http";
 import { createApp } from "./app.js";
 import { startMonitor, sendSessionInput } from "./monitor.js";
+import { startFailoverSupervisor } from "./failover.js";
 import { startSlackInputListener } from "./slack.js";
 import { attachTerminalBridge } from "./terminal-bridge.js";
 import { startTunnelListener } from "./tunnel-listener.js";
@@ -13,6 +14,7 @@ const server = createServer(app);
 attachTerminalBridge(server);
 
 startMonitor();
+startFailoverSupervisor();
 startSlackInputListener(sendSessionInput);
 server.listen(port, host, () => {
   console.log(`Devy listening on http://${host}:${port}`);

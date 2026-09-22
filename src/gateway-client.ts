@@ -5,6 +5,7 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { access, copyFile, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { Gateway } from "./gateway-core.js";
@@ -130,6 +131,60 @@ export async function prepareAccountDir(account: AccountDef): Promise<void> {
   }
 }
 
+/**
+ * Claude Code keeps first-run state in `<config dir>/.claude.json`. A fresh
+ * account dir has none, so a client started there shows the theme/login
+ * wizard and the folder-trust dialog instead of the conversation — fatal for
+ * an unattended relaunch. Mirror the default account's onboarding flags, and
+ * mark `cwd` trusted when the caller knows it already is (a session was
+ * running there) or the default account trusts it.
+ */
+export async function ensureClaudeOnboarded(dir: string, cwd: string, options: { trust?: boolean } = {}): Promise<void> {
+  const file = path.join(dir, ".claude.json");
+  let current: Record<string, unknown> = {};
+  try {
+    current = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+  } catch {
+    /* new dir */
+  }
+  let source: Record<string, unknown> = {};
+  const home = findAccount("claude-personal")!.dir;
+  for (const candidate of [path.join(os.homedir(), ".claude.json"), path.join(home, ".claude.json")]) {
+    try {
+      const parsed = JSON.parse(await readFile(candidate, "utf8")) as Record<string, unknown>;
+      if (parsed.hasCompletedOnboarding) {
+        source = parsed;
+        break;
+      }
+    } catch {
+      /* try next */
+    }
+  }
+  let changed = false;
+  if (current.hasCompletedOnboarding !== true) {
+    current.hasCompletedOnboarding = true;
+    changed = true;
+  }
+  for (const key of ["theme", "lastOnboardingVersion", "preferredNotifChannel", "editorMode", "autoUpdates", "hasSeenTasksHint"]) {
+    if (current[key] === undefined && source[key] !== undefined) {
+      current[key] = source[key];
+      changed = true;
+    }
+  }
+  const sourceProjects = (source.projects ?? {}) as Record<string, Record<string, unknown>>;
+  const trusted = options.trust ?? sourceProjects[cwd]?.hasTrustDialogAccepted === true;
+  if (trusted) {
+    const projects = (current.projects ??= {}) as Record<string, Record<string, unknown>>;
+    const entry = (projects[cwd] ??= {});
+    if (entry.hasTrustDialogAccepted !== true) {
+      entry.hasTrustDialogAccepted = true;
+      entry.hasCompletedProjectOnboarding = true;
+      changed = true;
+    }
+  }
+  if (changed) await writeFile(file, JSON.stringify(current, null, 2), { mode: 0o600 });
+}
+
 // ── Launching sessions through the gateway ────────────────────────────────
 
 /**
@@ -200,11 +255,17 @@ export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+/**
+ * The env is `export`ed rather than passed with `env ...` so it survives the
+ * agent exiting: the session's fallback shell inherits it, and a client typed
+ * there by hand still goes through the gateway instead of straight to the
+ * provider with its own login.
+ */
 export function launchCommand(agent: Lane, spec: LaunchSpec | null): string {
   if (!spec) return agent;
   const envPart = Object.entries(spec.env).map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ");
   const argPart = spec.args.map(shellQuote).join(" ");
-  return `${envPart ? `env ${envPart} ` : ""}${agent}${argPart ? ` ${argPart}` : ""}`;
+  return `${envPart ? `export ${envPart}; ` : ""}${agent}${argPart ? ` ${argPart}` : ""}`;
 }
 
 // ── Sign-in sessions ──────────────────────────────────────────────────────

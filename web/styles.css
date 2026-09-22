@@ -432,16 +432,9 @@ label > input, label > select, label > textarea { font-weight: 400; color: var(-
 .tty-status.warn { color: var(--amber); }
 .tty-status.bad { color: var(--coral); }
 .tty-head .right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
-.tty-keys { display: flex; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: none; }
-.tty-keys::-webkit-scrollbar { display: none; }
-.tty-keys .key { flex: 0 0 auto; min-height: 40px; min-width: 44px; }
-.tty-host { flex: 1; min-height: 0; padding: 6px 6px 2px; }
+.tty-host { flex: 1; min-height: 0; padding: 4px 4px 0; }
 .tty-host .xterm { height: 100%; }
 .tty-host .xterm-viewport { background: transparent !important; }
-.tty-input { display: flex; gap: 8px; align-items: center; padding: 8px; padding-bottom: calc(8px + var(--safe-bot)); border-top: 1px solid var(--line); background: var(--raise); }
-.tty-input input { flex: 1; min-width: 0; font-family: var(--mono); font-size: var(--t-16); background: var(--ink); min-height: 44px; }
-.tty-input input:disabled { opacity: 0.5; }
-.tty-input button { min-height: 44px; min-width: 56px; }
 .xterm .xterm-screen { padding: 4px; }
 .xterm-helper-textarea { font-size: 16px !important; }
 
@@ -537,6 +530,18 @@ label > input, label > select, label > textarea { font-weight: 400; color: var(-
 .gw-result-list { margin: 0; padding-left: 20px; font-size: var(--t-12); overflow-wrap: anywhere; }
 .gw-auto { margin-left: auto; display: inline-flex; flex-direction: row; align-items: center; gap: 10px; min-height: 44px; font-size: var(--t-14); color: var(--fg); cursor: pointer; }
 .gw-auto:has(input:focus-visible) .switch { outline: 2px solid var(--focus); outline-offset: 3px; }
+.gw-now { margin-bottom: var(--s-4); }
+.gw-now-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--s-3); }
+.gw-now-lane { padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r-2); display: grid; gap: 6px; min-width: 0; }
+.gw-now-lane .gw-title b { font-size: var(--t-14); }
+.gw-now-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.gw-now-list li { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-size: var(--t-12); min-width: 0; }
+.gw-now-list .rdot { flex: none; align-self: center; width: 7px; height: 7px; border-radius: 50%; background: var(--fg-3); }
+.gw-now-list .rdot.ok { background: var(--mint); }
+.gw-now-list .rdot.warn { background: var(--amber); }
+.gw-now-list .rdot.bad { background: var(--coral); }
+.gw-now-sess { color: var(--fg-3); font-size: var(--t-11); overflow-wrap: anywhere; }
+.gw-now .bad { color: var(--coral); }
 .gw-accounts { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: var(--s-3); }
 .gw-account { padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r-2); display: flex; flex-direction: column; gap: 6px; }
 .gw-account.on { border-color: rgba(61,220,151,0.35); }
@@ -562,6 +567,14 @@ label > input, label > select, label > textarea { font-weight: 400; color: var(-
 .gw-session-name { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .gw-session-name b { font-family: var(--mono); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gw-session > .gw-line { grid-column: 1 / -1; }
+.rt-session { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) auto; }
+.rt-status { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.rt-status .rdot { width: 7px; height: 7px; border-radius: 50%; background: var(--fg-3); flex: none; }
+.rt-status .rdot.ok { background: var(--mint); } .rt-status .rdot.warn { background: var(--amber); } .rt-status .rdot.bad { background: var(--coral); }
+.rt-status .warn { color: var(--amber); }
+.rt-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.rt-actions select { max-width: 260px; }
+@media (max-width: 720px) { .rt-session { grid-template-columns: minmax(0, 1fr); } .rt-actions { justify-content: flex-start; } .rt-actions select { max-width: 100%; flex: 1 1 100%; } }
 .gw-check { display: inline-flex; flex-direction: row; align-items: center; gap: 8px; font-size: var(--t-12); color: var(--fg-2); min-height: 40px; cursor: pointer; }
 .gw-check input { width: 16px; height: 16px; min-height: 0; margin: 0; accent-color: var(--mint); }
 .gw-log-wrap { overflow-x: auto; }
@@ -731,12 +744,12 @@ label > input, label > select, label > textarea { font-weight: 400; color: var(-
   .pick { flex: 0 0 auto; width: auto; min-width: 140px; max-width: 200px; border: 1px solid var(--line); border-radius: var(--r-2); padding: 8px 10px; min-height: 48px; }
   .pick.active { border-color: var(--violet); }
   .tty { border-radius: var(--r-2); }
-  .tty-head { padding: 8px 10px; }
-  .tty-head .right { width: 100%; margin-left: 0; }
+  .tty-head { padding: 6px 8px; gap: 8px; flex-wrap: nowrap; overflow: hidden; }
+  .tty-head .right { margin-left: auto; }
+  .tty-host { padding: 2px 0 0; }
+  body.kbd-open .tlist { display: none; }
   #term-detach { display: none; }
-  .tty-input { padding: 6px; padding-bottom: calc(6px + var(--safe-bot)); }
-  body.kbd-open .tty-input { padding-bottom: 6px; }
-
+    body.kbd-open 
   body[data-route="ai"] .page { padding: 6px 0 calc(var(--tabs-h) + var(--safe-bot) + 1px); }
   body[data-route="ai"].kbd-open .page { padding-bottom: 0; }
   .ai-page { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); gap: 6px; }

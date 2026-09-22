@@ -425,29 +425,37 @@ async function openRouteSwitcher(session) {
   let body;
   if (!Gateway.up) {
     body = `<p class="sub">The gateway is unavailable. Sessions connected through it need the gateway to recover before requests can continue.</p>`;
-  } else if (!a) {
-    body = `<p class="sub">This session was started outside the gateway, so it can't be switched. Recreate it from Sessions to pick a provider.</p>`;
+  } else if (!lane) {
+    body = `<p class="sub">Only Claude Code and Codex sessions can be routed through the gateway.</p>`;
   } else {
+    // Routes the gateway can switch to between requests are plain options. A
+    // different subscription login, or any route for a session that runs
+    // directly on its own login, needs the CLI restarted through the gateway
+    // with the conversation resumed — offered as a "restart" option.
     const opts = Gateway.routes(lane).map((r) => {
-      const eligible = Gateway.eligible(r, a);
-      const current = r.id === a.route;
+      const signedIn = !r.account || Boolean(Gateway.account(r.account)?.signedIn);
+      const usable = r.available && r.enabled !== false && signedIn;
+      const live = a ? Gateway.eligible(r, a) : false;
+      const current = Boolean(a) && r.id === a.route;
+      const relaunch = usable && !live;
       const acct = r.account ? Gateway.account(r.account) : null;
-      const sub = [r.provider, acct ? (acct.signedIn ? acct.label : `${acct.label} — not signed in`) : null, r.health?.cooling ? "cooling down" : r.health?.status === "error" ? "erroring" : null]
+      const sub = [r.provider, acct ? (acct.signedIn ? acct.label : `${acct.label} — not signed in`) : null, r.health?.cooling ? "cooling down" : r.health?.status === "error" ? "erroring" : null, relaunch ? "restarts & resumes the session" : null]
         .filter(Boolean).join(", ");
       return `
-        <button class="route-opt" data-route="${r.id}" ${eligible && !current ? "" : "disabled"} aria-pressed="${current}">
+        <button class="route-opt" data-route="${r.id}" ${relaunch ? 'data-relaunch="1"' : ""} ${usable && !current ? "" : "disabled"} aria-pressed="${current}">
           <span class="rdot ${routeHealth(r)}"></span>
           <span class="lbl">${escapeHtml(r.label)}<span class="sub">${escapeHtml(sub)}</span></span>
-          ${current ? `<span class="cur">current</span>` : ""}
+          ${current ? `<span class="cur">current</span>` : relaunch ? `<span class="cur">restart</span>` : ""}
         </button>`;
     }).join("");
     body = `
+      ${a ? "" : `<p class="sub">This session runs directly on its own login. Picking a provider restarts the CLI through the gateway and resumes its conversation.</p>`}
       <div class="routes">${opts}</div>
-      <label class="check-row" style="margin-top:4px;">
+      ${a ? `<label class="check-row" style="margin-top:4px;">
         <input type="checkbox" id="rs-auto" ${a.mode === "auto" ? "checked" : ""} />
-        <span>Switch automatically on rate limits and errors<small>Pinned sessions stay on the chosen route until you change it.</small></span>
+        <span>Switch automatically on rate limits and errors<small>When a login hits its limit Devy fails over inside the gateway, or restarts the session on the next signed-in account and resumes the conversation. Pinned sessions stay put.</small></span>
       </label>
-      <p class="sheet-note">A new route applies on the session's next request; the current one finishes on its old route.</p>`;
+      <p class="sheet-note">Routes on the same login apply on the session's next request. Options marked <b>restart</b> stop the CLI and relaunch it with the conversation resumed.</p>` : ""}`;
   }
   const { modal, close } = openModal(`
     <div class="overlay modal">
@@ -466,10 +474,24 @@ async function openRouteSwitcher(session) {
     const opt = e.target.closest(".route-opt");
     if (!opt || opt.disabled) return;
     const r = Gateway.route(opt.dataset.route);
+    if (opt.dataset.relaunch) {
+      const ok = await confirmDialog({
+        title: `Restart ${session} on ${r.label}?`,
+        body: "The running CLI is stopped and relaunched in the same tmux window through the gateway, with its conversation resumed. A turn in progress is interrupted.",
+        action: "Restart & resume"
+      });
+      if (!ok) return;
+    }
     $$(".route-opt", modal).forEach((b) => { b.disabled = true; });
     try {
-      await Gateway.switchRoute(session, r.id);
-      toast(`${session} → ${r.label} on its next request`, "ok", { duration: 5000 });
+      if (opt.dataset.relaunch) {
+        const res = await api(`/api/sessions/${encodeURIComponent(session)}/relaunch`, { method: "POST", body: JSON.stringify({ route: r.id }) });
+        Gateway.invalidate();
+        toast(`${session} restarted on ${r.label}${res.conversationId ? ", conversation resumed" : ""}`, "ok", { duration: 6000 });
+      } else {
+        await Gateway.switchRoute(session, r.id);
+        toast(`${session} → ${r.label} on its next request`, "ok", { duration: 5000 });
+      }
       close();
       refreshGlobal();
     } catch (error) {
@@ -651,6 +673,7 @@ route("sessions", {
 
 async function handleSessionAction(act, name, btn) {
   if (act === "stop") return stopSession(name);
+  if (act === "restart") return restartSession(name);
   if (act === "route") return openRouteSwitcher(name);
   if (act === "terminal") {
     State.selectedSession = name;
@@ -889,6 +912,7 @@ function requestHTML(s, arrived) {
         <button class="key" data-act="key" data-key="Enter" title="Send Enter">⏎</button>
         <span class="sep"></span>
         <button class="btn" data-act="terminal">Terminal</button>
+        <button class="btn btn-ghost" data-act="restart" title="Relaunch the CLI in this tmux window through the gateway and resume its conversation">Restart</button>
         <button class="btn btn-danger" data-act="stop">Stop</button>
       </div>
     </article>`;
@@ -917,6 +941,7 @@ function rowHTML(s) {
           <span class="sep"></span>
           <button class="btn" data-act="terminal">Terminal</button>
           <button class="btn btn-ghost" data-act="copy">Copy output</button>
+          <button class="btn btn-ghost" data-act="restart" title="Relaunch the CLI in this tmux window through the gateway and resume its conversation">Restart</button>
           <button class="btn btn-danger" data-act="stop">Stop</button>
         </div>
       </div>
@@ -967,6 +992,21 @@ async function stopSession(session) {
     refreshGlobal();
   } catch (error) {
     toast(`Couldn't stop: ${error.message}`, "error");
+  }
+}
+
+// Relaunch the CLI in place (same tmux window, same provider login, through the
+// gateway) and resume its conversation. A turn in progress is interrupted.
+async function restartSession(session) {
+  const ok = await confirmDialog({ title: `Restart ${session}?`, body: "The CLI is stopped and relaunched in the same tmux window through the gateway, with its conversation resumed. A turn in progress is interrupted.", action: "Restart & resume" });
+  if (!ok) return;
+  try {
+    const res = await api(`/api/sessions/${encodeURIComponent(session)}/relaunch`, { method: "POST", body: JSON.stringify({}) });
+    Gateway.invalidate();
+    toast(`${session} restarted${res.conversationId ? ", conversation resumed" : ""}`, "ok", { duration: 6000 });
+    refreshGlobal();
+  } catch (error) {
+    toast(`Couldn't restart: ${error.message}`, "error");
   }
 }
 
@@ -1068,20 +1108,7 @@ route("terminal", {
               <button class="btn btn-sm btn-ghost" id="term-detach">Pop out</button>
             </div>
           </div>
-          <div class="tty-keys" role="toolbar" aria-label="Terminal keys">
-            <button class="key" data-key="Escape">esc</button>
-            <button class="key" data-key="Tab">tab</button>
-            <button class="key" data-key="Up" aria-label="Arrow up">↑</button>
-            <button class="key" data-key="Down" aria-label="Arrow down">↓</button>
-            <button class="key" data-key="C-c" aria-label="Control C">^C</button>
-            <button class="key" data-key="C-d" aria-label="Control D">^D</button>
-            <button class="key" data-key="Enter" aria-label="Enter">⏎</button>
-          </div>
           <div class="tty-host" id="term-host"></div>
-          <form class="tty-input" id="term-input-row">
-            <input id="term-input" placeholder="Type to this session" aria-label="Type to this session" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="send" />
-            <button type="submit" class="btn btn-primary" title="Send Enter" aria-label="Send Enter">↵</button>
-          </form>
         </div>
       </div>
     `;
@@ -1091,50 +1118,16 @@ route("terminal", {
       const s = State.selectedSession;
       if (s) window.open(`#terminal/${encodeURIComponent(s)}`, "_blank", "width=1000,height=700");
     });
-    $$(".tty-keys .key").forEach((b) => b.addEventListener("click", () => { if (State.selectedSession) sendKeyTo(State.selectedSession, b.dataset.key); $("#term-input")?.focus(); }));
     $("#term-route").addEventListener("click", (e) => { if (e.target.closest("[data-act='route']") && State.selectedSession) openRouteSwitcher(State.selectedSession); });
-    // Tap the screen to focus xterm on desktop/tablet; the input row drives phones.
+    // The terminal is the whole page: tapping it focuses xterm, whose own
+    // hidden textarea raises the phone keyboard and takes desktop keystrokes.
     $("#term-host").addEventListener("click", () => { try { terminalState?.term?.focus(); } catch {/* */} });
-    wireTerminalInput();
     bootTerminal();
   },
   // Leaving drops the socket so the server stops polling tmux for a client
   // that isn't looking; the next visit starts clean.
   leave() { teardownTerminal(); },
 });
-
-// Plain text input that types straight into the tmux session over the socket.
-// xterm's hidden textarea is unreliable on phones, so this is the dependable
-// path to type on mobile — and a handy composer on desktop too.
-function wireTerminalInput() {
-  const input = $("#term-input");
-  const row = $("#term-input-row");
-  if (!input || !row) return;
-  let last = "";
-  const sendData = (data) => {
-    const ws = terminalState?.ws;
-    if (!ws || ws.readyState !== ws.OPEN) { toast("Terminal isn't connected yet", "error", { id: "term-ro" }); return false; }
-    if (!terminalState.canWrite) { toast("Read-only — save the access token in Settings to type", "error", { id: "term-ro" }); return false; }
-    ws.send(JSON.stringify({ type: "data", data }));
-    return true;
-  };
-  input.addEventListener("input", () => {
-    const v = input.value;
-    if (v.startsWith(last)) sendData(v.slice(last.length));
-    else if (last.startsWith(v)) { for (let i = 0; i < last.length - v.length; i++) sendData("\x7f"); }
-    else { for (let i = 0; i < last.length; i++) sendData("\x7f"); sendData(v); }
-    last = v;
-  });
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); sendData("\r"); input.value = ""; last = ""; }
-  });
-  row.addEventListener("submit", (e) => {
-    e.preventDefault();
-    sendData("\r");
-    input.value = ""; last = "";
-    input.focus();
-  });
-}
 
 let termListSig = "";
 function refreshTerminalList() {
@@ -1205,7 +1198,7 @@ function bootTerminal() {
 
   const term = new window.Terminal({
     fontFamily: '"IBM Plex Mono", "SF Mono", Menlo, Consolas, monospace',
-    fontSize: 13,
+    fontSize: window.matchMedia("(max-width: 720px)").matches ? 11 : 13,
     lineHeight: 1.2,
     cursorBlink: true,
     convertEol: true,
@@ -2167,6 +2160,7 @@ function paletteItems() {
     { kind: "page", label: "AI", href: "#ai" },
     { kind: "page", label: "Events", href: "#events" },
     { kind: "page", label: "Projects", href: "#projects" },
+    { kind: "page", label: "Routing", href: "#routing" },
     { kind: "page", label: "Gateway", href: "#gateway" },
     { kind: "page", label: "Settings", href: "#settings" },
     { kind: "action", label: "New session", action: () => openNewSessionModal() },
@@ -2242,6 +2236,7 @@ function openMoreSheet() {
       <div class="sheet dialog" role="dialog" aria-modal="true" aria-label="More">
         <nav class="more-list" aria-label="More pages">
           <a href="#projects"><span class="nav-ic" aria-hidden="true">⬡</span>Projects</a>
+          <a href="#routing"><span class="nav-ic" aria-hidden="true">◎</span>Routing</a>
           <a href="#gateway"><span class="nav-ic" aria-hidden="true">⇄</span>Gateway</a>
           <a href="#settings"><span class="nav-ic" aria-hidden="true">⚙</span>Settings</a>
           <a href="/remote/"><span class="nav-ic" aria-hidden="true">↗</span>Quick remote</a>

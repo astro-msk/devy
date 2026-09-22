@@ -86,6 +86,7 @@ export const envSchema = z.object({
   CODEX_TMUX_SESSION: stringWithDefault("codex"),
   ENABLE_AGENT_INPUT: flag(true),
   AGENT_WAIT_ALERT_SECONDS: integer("AGENT_WAIT_ALERT_SECONDS", 30, 10, 3600),
+  ENABLE_LIVE_FAILOVER: flag(true),
   EVENT_RETENTION_DAYS: integer("EVENT_RETENTION_DAYS", 90, 1, 3650),
 
   // ── Slack ────────────────────────────────────────────────────────────────
@@ -157,6 +158,7 @@ export const configDocs: Record<ConfigKey, string> = {
   CODEX_TMUX_SESSION: "tmux session used by the legacy /api/agents/codex/input endpoint (default codex)",
   ENABLE_AGENT_INPUT: "false = disable browser/Slack typing into tmux sessions (default true)",
   AGENT_WAIT_ALERT_SECONDS: "seconds a session must look like it needs input before alerting (default 30, range 10-3600)",
+  ENABLE_LIVE_FAILOVER: "false = never restart a session on another account when its login hits a usage limit (default true; also needs gateway auto-switch on)",
   EVENT_RETENTION_DAYS: "days to keep events, Slack alert threads and chat turns in SQLite (default 90, range 1-3650)",
   SLACK_WEBHOOK_URL: "incoming webhook for alerts when no bot token is set",
   SLACK_BOT_TOKEN: "xoxb- bot token for posting alerts and reports",
