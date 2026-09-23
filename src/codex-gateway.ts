@@ -129,10 +129,12 @@ export function connectCodexGateway(routeAccount: string | null): Promise<CodexS
  */
 export function restartCodexServer(): Promise<{ restarted: number; pids: number[] }> {
   return new Promise((resolve) => {
-    execFile("pgrep", ["-af", "codex app-server"], { timeout: 3000 }, (error, stdout) => {
+    execFile("pgrep", ["-af", "app-server --listen"], { timeout: 3000 }, (error, stdout) => {
       const pids = (stdout || "")
         .split("\n")
-        .filter((line) => /\bcodex app-server\b/.test(line) && !/\bproxy\b/.test(line) && !/pgrep/.test(line))
+        // The desktop spawns `codex [-c key=value ...] app-server --listen ...`; the
+        // ssh-side `codex app-server proxy` processes are not the daemon.
+        .filter((line) => /\bcodex\b.*\bapp-server\b/.test(line) && /--listen/.test(line) && !/\bproxy\b/.test(line) && !/pgrep/.test(line))
         .map((line) => Number(line.trim().split(/\s+/)[0]))
         .filter((pid) => Number.isInteger(pid) && pid > 0);
       let restarted = 0;
